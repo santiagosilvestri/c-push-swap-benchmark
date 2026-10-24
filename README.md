@@ -2,7 +2,7 @@
 
 *Created by **Santiago Silvestri** as a portable benchmarking tool for multi-strategy `push_swap` implementations.*
 
-A single-file C benchmark that compares `--simple`, `--medium`, `--complex`, and `--adaptive`, validates their output, and displays the results as a terminal graph.
+A single-file C benchmark that compares the available `--simple`, `--medium`, `--complex`, and `--adaptive` modes, validates their output, and displays the results as a terminal graph. It also works with standard `push_swap` programs that accept no strategy flags.
 
 ## Use it in your Push Swap
 
@@ -26,7 +26,27 @@ Run it:
 ./ps_benchmark
 ```
 
+For a first custom run, start with just three options:
+
+```bash
+./ps_benchmark -a complex, simple, medium -m 100 -r 3
+```
+
+- `-a`: choose which algorithms to compare.
+- `-m`: set the maximum number of elements.
+- `-r`: set the runs averaged for each size.
+
+An invalid command shows only these basic options and a working example. Use `-h` or `--help` to see every option. Full help is printed to stdout; errors and brief usage guidance go to stderr.
+
 The benchmark is compiled independently and does not modify your `push_swap`, headers, libraries, or checker.
+
+You can keep the benchmark outside your project and pass the executable path:
+
+```bash
+./ps_benchmark --program ../c-push-swap/push_swap
+```
+
+Paths are used directly, without a shell or a `PATH` search. Quote paths containing spaces.
 
 ## Preview
 
@@ -36,8 +56,8 @@ The benchmark is compiled independently and does not modify your `push_swap`, he
 
 The tested program must:
 
-- be available as `./push_swap`;
-- accept `--simple`, `--medium`, `--complex`, and `--adaptive`;
+- be available as `./push_swap` or at the path passed to `--program`;
+- accept at least one selected strategy flag, or work without strategy flags;
 - accept the numbers as separate command-line arguments;
 - print only valid `push_swap` operations, one per line;
 - exit with status `0` after a valid execution.
@@ -49,6 +69,22 @@ Example:
 ```
 
 The benchmark is intended for Linux, macOS, WSL, and other POSIX-compatible systems.
+
+## Optional strategy flags
+
+Before measuring, the benchmark checks each selected mode with two fixed, unsorted five-element inputs. It validates operations and final stacks using the same verifier as the benchmark.
+
+- A flag that exits with status 1–125 and prints no operations on its first probe is reported as rejected and skipped. The warning names the flag: it may be unsupported or have faulty input handling. A rejection after a successful first probe stops the run.
+- Available modes continue with the same generated inputs, graphs, and statistics.
+- If every selected flag is rejected, the benchmark tries execution without a strategy flag, displayed as `default`.
+- To test a standard program directly, use `--algorithms default`.
+- To compare unflagged execution with specific strategies, use, for example, `--algorithms default,medium,complex`.
+
+The startup checks do not consume the random generator or contribute to operation statistics or benchmark progress. Workload limits are checked after removing rejected modes.
+
+These are compatibility checks, not proof that an internal strategy exists. A program that silently ignores a flag can pass them. Only selected flags are checked; an unselected mode is not reported as missing.
+
+Crashes, timeouts, invalid operations, empty output with exit status 0 on unsorted input, and incorrect sorting stop the benchmark, including during startup. They are not silently classified as missing flags. Once measurement begins, any failure stops the run as before. Rejected flags should report diagnostics on stderr; text such as `Error` on stdout is invalid operation output and stops the run.
 
 ## Recommended commands
 
@@ -85,10 +121,11 @@ Display all available options:
 
 | Short | Long | Default | Description |
 |---|---|---:|---|
+| `-b` | `--program` | `./push_swap` | Path to the executable to test. |
 | `-m` | `--max` | `500` | Maximum input size, from 2 to 50000. |
 | `-p` | `--samples` | `10` | Number of input sizes represented in the graph. |
 | `-r` | `--runs` | `3` | Runs performed for each size. |
-| `-a` | `--algorithms` | `all` | Strategies to compare. |
+| `-a` | `--algorithms` | `all` | Strategies to compare; rejected flags are skipped. |
 | `-d` | `--disorder` | random | Target disorder percentage, from 0 to 100. |
 | `-l` | `--log` | disabled | Use a logarithmic vertical scale. |
 | `-H` | `--height` | `18` | Graph height, from 8 to 40 rows. |
@@ -96,17 +133,24 @@ Display all available options:
 | `-s` | `--seed` | current time | Seed used to reproduce generated inputs. |
 | `-h` | `--help` | — | Display the help message. |
 
-Algorithms are provided as a comma-separated list:
+Algorithm names can be provided in any order, separated by commas, spaces, or both. These examples select the same modes:
 
 ```bash
-./ps_benchmark --algorithms simple,medium
+./ps_benchmark -a complex,simple,medium
+./ps_benchmark -a complex, simple, medium
+./ps_benchmark -a "complex, simple, medium"
+./ps_benchmark -a medium simple complex
 ```
+
+Spaces around commas are optional; quotation marks are not required for the unquoted examples. Repeated names are measured once. Empty entries such as `simple,,medium` or a trailing comma are rejected. The next option, such as `-m` or `-r`, ends the algorithm list.
 
 Valid names:
 
 ```text
-simple,medium,complex,adaptive,all
+simple,medium,complex,adaptive,default,all
 ```
+
+`all` selects the four strategy flags, with automatic fallback to `default` when none remain. It does not add an extra unflagged comparison when a flagged mode is available. You can explicitly request all five with `all,default` or `simple,medium,complex,adaptive,default`.
 
 ## How the benchmark works
 
@@ -114,7 +158,7 @@ For every input size and run, the benchmark:
 
 1. Generates one permutation.
 2. Sends the same permutation to every selected algorithm.
-3. Executes `./push_swap` in an independent child process.
+3. Executes the selected program in an independent child process.
 4. Captures and counts its operations.
 5. Applies the operations to internal stacks.
 6. Verifies that stack A is sorted and stack B is empty.
@@ -219,6 +263,22 @@ This is particularly useful when `simple` is included, because its quadratic beh
 
 The logarithmic graph changes only the visualization. It does not change the measured values.
 
+## Terminal size
+
+For an interactive terminal, the benchmark checks the window size before measurement and suggests widening or maximizing it, or reducing the font size, when the full graph will not fit. You can resize the terminal while the benchmark is running; the graph uses the width available when it is printed.
+
+The recommended width depends on the number of measured sizes and available modes. For example, ten sizes with four modes require at least 102 columns in the compact graph.
+
+If the terminal stays too narrow:
+
+- the graph shows a representative subset and reports how many sizes are visible;
+- the message gives the minimum width needed to show every size;
+- when even one group of bars cannot fit, the graph is omitted and the statistics for the maximum size are still printed;
+- below 60 columns, statistics and ratings use a vertical layout;
+- a short terminal receives a suggestion to increase its height, use `--height 8`, or scroll.
+
+All configured sizes are still measured. Terminal size affects presentation only. To redraw after the program has finished, widen the terminal and rerun the same command with the displayed `--seed` value.
+
 ## Performance ratings
 
 A rating is shown only when the maximum input size is exactly 100 or 500.
@@ -268,7 +328,7 @@ The benchmark includes protections against accidental heavy executions:
 - timeout for each child process;
 - maximum accepted operation count;
 - termination of blocked or excessively long processes;
-- validation that `./push_swap` exists and is executable.
+- validation that the selected program exists and is executable.
 
 Large values remain expensive even when permitted. Start with 100 or 500 elements before testing larger inputs.
 

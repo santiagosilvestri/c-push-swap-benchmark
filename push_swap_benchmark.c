@@ -17,6 +17,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <float.h>
@@ -33,12 +34,15 @@
 #include <time.h>
 #include <unistd.h>
 
-#define ALG_COUNT 4
+#define ALG_COUNT 5
 #define ALG_SIMPLE 0
 #define ALG_MEDIUM 1
 #define ALG_COMPLEX 2
 #define ALG_ADAPTIVE 3
+#define ALG_DEFAULT 4
 #define MASK_ALL 15U
+#define PROBE_REJECTED -5
+#define EMPTY_OUTPUT -6
 
 #define ROUTE_SIMPLE 0
 #define ROUTE_MEDIUM 1
@@ -78,6 +82,7 @@ typedef struct s_config
     unsigned int    algorithms;
     unsigned int    seed;
     unsigned int    rng_state;
+    const char      *program;
 }   t_config;
 
 typedef struct s_result
@@ -202,34 +207,74 @@ static int	algorithm_index(const char *name)
 		return (ALG_COMPLEX);
 	if (strcmp(name, "adaptive") == 0)
 		return (ALG_ADAPTIVE);
+	if (strcmp(name, "default") == 0)
+		return (ALG_DEFAULT);
 	return (-1);
 }
 
-static int	parse_algorithms(const char *text, unsigned int *mask)
+static int	parse_algorithm_words(const char *text, unsigned int *mask,
+		int *needs_name)
 {
-	char	copy[128];
-	char	*token;
+	char	name[32];
 	size_t	length;
 	int		index;
 
-	length = strlen(text);
-	if (length == 0 || length >= sizeof(copy) || text[0] == ','
-		|| text[length - 1] == ',' || strstr(text, ",,") != NULL)
+	if (*text == '\0')
 		return (0);
-	memcpy(copy, text, length + 1);
-	if (strcmp(copy, "all") == 0)
-		return (*mask = MASK_ALL, 1);
-	*mask = 0;
-	token = strtok(copy, ",");
-	while (token)
+	while (*text)
 	{
-		index = algorithm_index(token);
-		if (index < 0)
-			return (0);
-		*mask |= (1U << index);
-		token = strtok(NULL, ",");
+		if (isspace((unsigned char)*text))
+			text++;
+		else if (*text == ',')
+		{
+			if (*needs_name)
+				return (0);
+			*needs_name = 1;
+			text++;
+		}
+		else
+		{
+			length = 0;
+			while (*text && *text != ',' && !isspace((unsigned char)*text))
+			{
+				if (length + 1 >= sizeof(name))
+					return (0);
+				name[length++] = *text++;
+			}
+			name[length] = '\0';
+			index = algorithm_index(name);
+			if (strcmp(name, "all") == 0)
+				*mask |= MASK_ALL;
+			else if (index >= 0)
+				*mask |= (1U << index);
+			else
+				return (0);
+			*needs_name = 0;
+		}
 	}
-	return (*mask != 0);
+	return (1);
+}
+
+static int	set_algorithms(char **argv, int *i, unsigned int *mask)
+{
+	unsigned int	selected;
+	int				next;
+	int				needs_name;
+
+	selected = 0;
+	needs_name = 1;
+	next = *i + 1;
+	while (argv[next] && argv[next][0] != '-')
+	{
+		if (!parse_algorithm_words(argv[next], &selected, &needs_name))
+			return (0);
+		next++;
+	}
+	if (selected == 0 || needs_name)
+		return (0);
+	*mask = selected;
+	*i = next - 1;
+	return (1);
 }
 
 static int	is_option(const char *arg, const char *short_name,
@@ -253,6 +298,13 @@ static int	set_integer_option(char **argv, int *i, int *target,
 
 static int	set_option(char **argv, int *i, t_config *config)
 {
+	if (is_option(argv[*i], "-b", "--program"))
+	{
+		if (!argv[*i + 1] || argv[*i + 1][0] == '\0')
+			return (0);
+		config->program = argv[++(*i)];
+		return (1);
+	}
 	if (is_option(argv[*i], "-m", "--max"))
 		return (set_integer_option(argv, i, &config->max_n, 2,
 				MAX_ELEMENTS));
@@ -281,13 +333,7 @@ static int	set_option(char **argv, int *i, t_config *config)
 		return (1);
 	}
 	if (is_option(argv[*i], "-a", "--algorithms"))
-	{
-		if (!argv[*i + 1]
-			|| !parse_algorithms(argv[*i + 1], &config->algorithms))
-			return (0);
-		(*i)++;
-		return (1);
-	}
+		return (set_algorithms(argv, i, &config->algorithms));
 	return (0);
 }
 
@@ -354,7 +400,7 @@ int	parse_config(int argc, char **argv, t_config *config)
 	int	i;
 
 	*config = (t_config){500, 10, 3, 18, 0, 0, 0, DEFAULT_TIMEOUT,
-		MASK_ALL, (unsigned int)time(NULL), 0};
+		MASK_ALL, (unsigned int)time(NULL), 0, "./push_swap"};
 	i = 1;
 	while (i < argc)
 	{
@@ -370,25 +416,38 @@ int	parse_config(int argc, char **argv, t_config *config)
 	config->rng_state = config->seed;
 	if (config->rng_state == 0)
 		config->rng_state = 0x9e3779b9U;
-	if (!validate_workload(config))
-		return (0);
-	if (access("./push_swap", X_OK) != 0)
-		return (fprintf(stderr, "Error: ./push_swap was not found or is not "
-				"executable.\n"), 0);
+	if (access(config->program, X_OK) != 0)
+		return (fprintf(stderr, "Error: %s was not found or is not "
+				"executable.\n", config->program), 0);
 	return (1);
+}
+
+static void	print_brief_usage(const char *program)
+{
+	fprintf(stderr, "\nUsage: %s [options]\n", program);
+	fprintf(stderr, "  -a LIST   Algorithms to compare (default: all)\n");
+	fprintf(stderr, "  -m N      Maximum number of elements (default: 500)\n");
+	fprintf(stderr, "  -r N      Runs averaged per size (default: 3)\n");
+	fprintf(stderr, "\nExample: %s -a complex, simple -m 100 -r 3\n", program);
+	fprintf(stderr, "All options: %s --help (or -h)\n", program);
 }
 
 void	print_usage(const char *program)
 {
 	printf("Usage: %s [options]\n", program);
+	printf("  -b, --program PATH   Executable path (default: ./push_swap)\n");
 	printf("  -m, --max N          Maximum input size, 2-%d (default: 500)\n",
 		MAX_ELEMENTS);
 	printf("  -p, --samples N      Measured X-axis sizes, 1-%d (default: 10)\n",
 		MAX_SAMPLES);
 	printf("  -r, --runs N         Runs averaged per size, 1-%d (default: 3)\n",
 		MAX_RUNS);
-	printf("  -a, --algorithms L   all or comma-separated algorithm names\n");
-	printf("                       simple,medium,complex,adaptive\n");
+	printf("  -a, --algorithms L   Names separated by commas or spaces\n");
+	printf("                       simple,medium,complex,adaptive,default\n");
+	printf("                       Any order; spaces around commas are accepted\n");
+	printf("                       Example: -a complex, simple, medium\n");
+	printf("                       all probes the four flags; skips rejected ones\n");
+	printf("                       Falls back to default (no flag) if none remain\n");
 	printf("  -d, --disorder P     Exact target disorder percentage, 0-100\n");
 	printf("  -l, --log            Use a logarithmic operation scale\n");
 	printf("  -H, --height N       Chart height, 8-40 (default: 18)\n");
@@ -424,6 +483,8 @@ const char	*algorithm_name(int algorithm)
 		return ("medium");
 	if (algorithm == ALG_COMPLEX)
 		return ("complex");
+	if (algorithm == ALG_DEFAULT)
+		return ("default");
 	return ("adaptive");
 }
 
@@ -435,6 +496,8 @@ const char	*algorithm_flag(int algorithm)
 		return ("--medium");
 	if (algorithm == ALG_COMPLEX)
 		return ("--complex");
+	if (algorithm == ALG_DEFAULT)
+		return (NULL);
 	return ("--adaptive");
 }
 
@@ -446,6 +509,8 @@ const char	*algorithm_terminal_color(int algorithm)
 		return ("\033[38;5;75m");
 	if (algorithm == ALG_COMPLEX)
 		return ("\033[38;5;78m");
+	if (algorithm == ALG_DEFAULT)
+		return ("\033[38;5;220m");
 	return ("\033[38;5;177m");
 }
 
@@ -798,6 +863,8 @@ static int	verifier_init(t_verifier *verifier, int *values, int size)
 
 static int	feed_character(t_verifier *verifier, char character)
 {
+	if (character == '\0')
+		return (0);
 	if (character != '\n')
 	{
 		if (verifier->line_length >= 3)
@@ -948,13 +1015,13 @@ int	verify_push_swap_output(int fd, pid_t pid, int *values, int size,
 	int			operations;
 
 	if (!verifier_init(&verifier, values, size))
-		return (-1);
+		return (kill_child_processes(pid), -1);
 	status = read_output(fd, pid, &verifier, timeout_seconds, start);
 	operations = verifier.operations;
 	if (status == 0 && verifier.line_length != 0)
 		status = -3;
 	if (status == 0 && !verifier_is_sorted(&verifier))
-		status = -4;
+		status = (operations == 0 ? EMPTY_OUTPUT : -4);
 	free(verifier.a.data);
 	free(verifier.b.data);
 	if (status < 0)
@@ -965,25 +1032,28 @@ int	verify_push_swap_output(int fd, pid_t pid, int *values, int size,
 /* ===== benchmark_exec.c ===== */
 
 static char	**build_arguments(int algorithm, int *values, int size,
-		char **storage)
+		char **storage, const char *program)
 {
 	char	**args;
 	int		i;
+	int		offset;
 
 	args = malloc(sizeof(*args) * ((size_t)size + 3));
 	*storage = malloc((size_t)size * 16);
 	if (!args || !*storage)
 		return (free(args), free(*storage), NULL);
-	args[0] = "./push_swap";
-	args[1] = (char *)algorithm_flag(algorithm);
+	args[0] = (char *)program;
+	offset = 1;
+	if (algorithm_flag(algorithm) != NULL)
+		args[offset++] = (char *)algorithm_flag(algorithm);
 	i = 0;
 	while (i < size)
 	{
 		snprintf(*storage + (i * 16), 16, "%d", values[i]);
-		args[i + 2] = *storage + (i * 16);
+		args[i + offset] = *storage + (i * 16);
 		i++;
 	}
-	args[size + 2] = NULL;
+	args[size + offset] = NULL;
 	return (args);
 }
 
@@ -1017,6 +1087,8 @@ static void	print_verification_error(int code, int algorithm, int size,
 			MAX_OPERATIONS);
 	else if (code == -4)
 		fprintf(stderr, "operations did not sort the input.\n");
+	else if (code == EMPTY_OUTPUT)
+		fprintf(stderr, "no operations for an unsorted input.\n");
 	else
 		fprintf(stderr, "could not read or validate the output.\n");
 }
@@ -1033,7 +1105,8 @@ static void	print_child_error(int status, int algorithm, int size)
 		fprintf(stderr, "process did not terminate normally.\n");
 }
 
-int	run_push_swap(int algorithm, int *values, int size, t_config *config)
+static int	execute_push_swap(int algorithm, int *values, int size,
+		t_config *config, int probe)
 {
 	char	**args;
 	char	*storage;
@@ -1047,7 +1120,7 @@ int	run_push_swap(int algorithm, int *values, int size, t_config *config)
 	int		operations;
 
 	storage = NULL;
-	args = build_arguments(algorithm, values, size, &storage);
+	args = build_arguments(algorithm, values, size, &storage, config->program);
 	if (!args)
 		return (-1);
 	if (pipe(pipefd) < 0)
@@ -1100,15 +1173,84 @@ int	run_push_swap(int algorithm, int *values, int size, t_config *config)
 	free(storage);
 	if (g_stop_signal != 0)
 		return (-1);
+	/* A rejected flag normally exits nonzero without printing operations.
+	 * Never turn crashes, timeouts or incorrect operations into missing flags. */
+	if (probe && algorithm != ALG_DEFAULT && operations == EMPTY_OUTPUT
+		&& WIFEXITED(status) && WEXITSTATUS(status) > 0
+		&& WEXITSTATUS(status) < 126)
+	{
+		fprintf(stderr, "Warning: %s rejected a valid probe (exit %d); "
+			"skipped. The flag may be unsupported or its input handling "
+			"may be faulty.\n", algorithm_flag(algorithm), WEXITSTATUS(status));
+		return (PROBE_REJECTED);
+	}
 	if (operations == -1 || operations == -2 || operations == -3)
 		return (print_verification_error(operations, algorithm, size,
 				config->timeout_seconds), -1);
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		return (print_child_error(status, algorithm, size), -1);
-	if (operations == -4)
+	if (operations == -4 || operations == EMPTY_OUTPUT)
 		return (print_verification_error(operations, algorithm, size,
 				config->timeout_seconds), -1);
 	return (operations);
+}
+
+int	run_push_swap(int algorithm, int *values, int size, t_config *config)
+{
+	return (execute_push_swap(algorithm, values, size, config, 0));
+}
+
+/* Probe fixed unsorted inputs without consuming the benchmark RNG sequence.
+ * These executions validate compatibility; they are not measured samples. */
+static int	probe_algorithm(int algorithm, t_config *config)
+{
+	int	values[2][5] = {{2, 0, 4, 1, 3}, {4, 3, 2, 1, 0}};
+	int	i;
+	int	operations;
+
+	i = 0;
+	while (i < 2)
+	{
+		/* Once a flag has succeeded, a later rejection is a real failure. */
+		operations = execute_push_swap(algorithm, values[i], 5, config, i == 0);
+		if (operations < 0)
+			return (operations);
+		i++;
+	}
+	return (0);
+}
+
+static int	detect_algorithms(t_config *config)
+{
+	unsigned int	available;
+	int				algorithm;
+	int				status;
+
+	available = 0;
+	algorithm = 0;
+	while (algorithm < ALG_COUNT)
+	{
+		if (config->algorithms & (1U << algorithm))
+		{
+			status = probe_algorithm(algorithm, config);
+			if (status == 0)
+				available |= (1U << algorithm);
+			else if (status != PROBE_REJECTED)
+				return (fprintf(stderr, "Compatibility check failed; "
+						"this is not treated as a missing flag.\n"), 0);
+		}
+		algorithm++;
+	}
+	if (available == 0)
+	{
+		fprintf(stderr, "No selected flag passed the probe; trying default "
+			"execution without flags.\n");
+		if (probe_algorithm(ALG_DEFAULT, config) < 0)
+			return (0);
+		available = (1U << ALG_DEFAULT);
+	}
+	config->algorithms = available;
+	return (1);
 }
 
 /* ===== benchmark_progress.c ===== */
@@ -1238,6 +1380,40 @@ static int	terminal_width(void)
 	return (120);
 }
 
+static int	compact_group_width(t_config *config)
+{
+	char	label[32];
+	int		width;
+	int		label_width;
+
+	width = selected_count(config->algorithms) * 2 + 1;
+	label_width = snprintf(label, sizeof(label), "%d", config->max_n);
+	if (label_width > width)
+		width = label_width;
+	return (width);
+}
+
+static void	print_terminal_hint(t_config *config, int count)
+{
+	struct winsize	window;
+	int				needed;
+
+	if (!isatty(STDOUT_FILENO)
+		|| ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) != 0)
+		return ;
+	needed = 12 + count * compact_group_width(config);
+	if (window.ws_col > 0 && window.ws_col < needed)
+	{
+		printf("Terminal: %u columns; full chart needs %d.\n",
+			(unsigned int)window.ws_col, needed);
+		printf("Widen/maximize the terminal or reduce the font size\n"
+			"before the benchmark finishes to see every measured size.\n\n");
+	}
+	if (window.ws_row > 0 && window.ws_row < config->chart_height + 8)
+		printf("Tip: increase the terminal height, use --height 8,\n"
+			"or scroll to view the complete chart.\n\n");
+}
+
 static double	scale_value(t_config *config, double value)
 {
 	if (config->log_scale)
@@ -1332,13 +1508,11 @@ static int	visible_groups(t_config *config, int count, int *bar_width,
 	if (*group_width * count > available)
 	{
 		*bar_width = 1;
-		*group_width = selected * 2 + 1;
-		if (*group_width < label_width)
-			*group_width = label_width;
+		*group_width = compact_group_width(config);
 	}
 	groups = available / *group_width;
-	if (groups < 1)
-		groups = 1;
+	if (groups < 0)
+		groups = 0;
 	if (groups > count)
 		groups = count;
 	return (groups);
@@ -1351,7 +1525,7 @@ static int	result_index(int shown_index, int shown_count, int total_count)
 	return ((shown_index * (total_count - 1)) / (shown_count - 1));
 }
 
-static int	grid_tick(int row, int height, int *tick)
+static int	grid_tick(int row, int height)
 {
 	int	i;
 	int	tick_row;
@@ -1361,10 +1535,7 @@ static int	grid_tick(int row, int height, int *tick)
 	{
 		tick_row = (i * height) / 5;
 		if (row == tick_row)
-		{
-			*tick = 5 - i;
 			return (1);
-		}
 		i++;
 	}
 	return (0);
@@ -1422,7 +1593,6 @@ static void	print_chart_row(t_config *config, t_result *results, int count,
 		int shown, int bar_width, int group_width, double maximum, int row)
 {
 	int	grid;
-	int	tick;
 	int	i;
 	int	algorithm;
 	int	index;
@@ -1430,9 +1600,10 @@ static void	print_chart_row(t_config *config, t_result *results, int count,
 	int	padding;
 	int	used_width;
 
-	grid = grid_tick(row, config->chart_height, &tick);
+	grid = grid_tick(row, config->chart_height);
 	if (grid)
-		printf("%8.0f ┤", unscale_value(config, maximum * tick / 5.0));
+		printf("%8.0f ┤", unscale_value(config, maximum
+				* (config->chart_height - row) / config->chart_height));
 	else
 		printf("         │");
 	color = isatty(STDOUT_FILENO);
@@ -1555,20 +1726,30 @@ static void	print_maximum_summary(t_config *config, t_result *result)
 	int	algorithm;
 
 	printf("\nStatistics for %d elements\n\n", result->n);
-	printf("%-12s %11s %11s %11s %11s\n", "Algorithm", "Average",
-		"Best", "Worst", "Std. dev.");
+	if (terminal_width() >= 60)
+		printf("%-12s %11s %11s %11s %11s\n", "Algorithm", "Average",
+			"Best", "Worst", "Std. dev.");
 	algorithm = 0;
 	while (algorithm < ALG_COUNT)
 	{
 		if (config->algorithms & (1U << algorithm))
-			printf("%-12s %11.1f %11.0f %11.0f %11.1f\n",
+		{
+			if (terminal_width() < 60)
+				printf("%s\n  Average: %.1f\n  Best: %.0f\n"
+					"  Worst: %.0f\n  Std. dev.: %.1f\n",
+					algorithm_name(algorithm), result->avg[algorithm],
+					result->min[algorithm], result->max[algorithm],
+					result->stddev[algorithm]);
+			else
+				printf("%-12s %11.1f %11.0f %11.0f %11.1f\n",
 				algorithm_name(algorithm), result->avg[algorithm],
 				result->min[algorithm], result->max[algorithm],
 				result->stddev[algorithm]);
+		}
 		algorithm++;
 	}
-	printf("\nMeasured disorder: average %.2f%%, minimum %.2f%%, "
-		"maximum %.2f%%\n", result->disorder_avg, result->disorder_min,
+	printf("\nMeasured disorder\n  Average: %.2f%%\n  Minimum: %.2f%%\n"
+		"  Maximum: %.2f%%\n", result->disorder_avg, result->disorder_min,
 		result->disorder_max);
 }
 
@@ -1590,14 +1771,22 @@ static void	print_performance_rating(t_config *config, t_result *result)
 	if (config->max_n != 100 && config->max_n != 500)
 		return ;
 	printf("\nPerformance rating for %d elements\n\n", config->max_n);
-	printf("%-12s %18s  %s\n", "Algorithm", "Average operations", "Rating");
+	if (terminal_width() >= 60)
+		printf("%-12s %18s  %s\n", "Algorithm", "Average operations", "Rating");
 	algorithm = 0;
 	while (algorithm < ALG_COUNT)
 	{
 		if (config->algorithms & (1U << algorithm))
-			printf("%-12s %18.1f  %s\n", algorithm_name(algorithm),
-				result->avg[algorithm], performance_rating(
-					result->avg[algorithm], config->max_n));
+		{
+			if (terminal_width() < 60)
+				printf("%s\n  Average operations: %.1f\n  Rating: %s\n",
+					algorithm_name(algorithm), result->avg[algorithm],
+					performance_rating(result->avg[algorithm], config->max_n));
+			else
+				printf("%-12s %18.1f  %s\n", algorithm_name(algorithm),
+					result->avg[algorithm], performance_rating(
+						result->avg[algorithm], config->max_n));
+		}
 		algorithm++;
 	}
 	printf("\nRating based on average operations measured by this benchmark.\n");
@@ -1622,6 +1811,20 @@ void	write_terminal_chart(t_config *config, t_result *results, int count)
 	shown = visible_groups(config, count, &bar_width, &group_width);
 	color = isatty(STDOUT_FILENO);
 	printf("\n");
+	if (shown == 0)
+	{
+		printf("Chart omitted: terminal too narrow (%d columns).\n",
+			terminal_width());
+		printf("Widen/maximize it to at least %d columns for the chart,\n",
+			12 + compact_group_width(config));
+		printf("or %d columns to show all %d measured sizes.\n",
+			12 + count * compact_group_width(config), count);
+		printf("Then rerun the same command with --seed %u.\n", config->seed);
+		print_maximum_summary(config, &results[count - 1]);
+		print_adaptive_routes(config, &results[count - 1]);
+		print_performance_rating(config, &results[count - 1]);
+		return ;
+	}
 	if (color)
 		printf("%s", BOLD);
 	printf("Algorithm comparison");
@@ -1640,8 +1843,13 @@ void	write_terminal_chart(t_config *config, t_result *results, int count)
 	print_x_axis(results, count, shown, group_width);
 	print_legend(config);
 	if (shown < count)
+	{
 		printf("Note: terminal width shows %d of %d measured sizes.\n",
 			shown, count);
+		printf("Widen/maximize it to at least %d columns to show them all.\n",
+			12 + count * compact_group_width(config));
+		printf("Then rerun the same command with --seed %u.\n", config->seed);
+	}
 	print_maximum_summary(config, &results[count - 1]);
 	print_adaptive_routes(config, &results[count - 1]);
 	print_performance_rating(config, &results[count - 1]);
@@ -1707,6 +1915,7 @@ static void	print_algorithms(unsigned int algorithms)
 static void	print_configuration(t_config *config, int count)
 {
 	printf("sasilves | Portable Push Swap Graph Benchmark\n\n");
+	printf("Executable:     %s\n", config->program);
 	printf("Maximum size:   %d\n", config->max_n);
 	printf("Measured sizes: %d\n", count);
 	printf("Runs per size:  %d\n", config->runs);
@@ -1857,17 +2066,23 @@ int	main(int argc, char **argv)
 	status = parse_config(argc, argv, &config);
 	if (status != 1)
 	{
-		print_usage(argv[0]);
+		if (status == 2)
+			print_usage(argv[0]);
+		else
+			print_brief_usage(argv[0]);
 		return (status == 2 ? 0 : 1);
 	}
+	if (!install_stop_signal_handlers())
+		return (perror("sigaction"), 1);
+	if (!detect_algorithms(&config) || !validate_workload(&config))
+		return (g_stop_signal != 0 ? 128 + g_stop_signal : 1);
 	count = result_count(&config);
 	results = calloc((size_t)count, sizeof(t_result));
 	if (!results)
 		return (perror("calloc"), 1);
 	set_sizes(&config, results, count);
 	print_configuration(&config, count);
-	if (!install_stop_signal_handlers())
-		return (free(results), perror("sigaction"), 1);
+	print_terminal_hint(&config, count);
 	if (!run_benchmark(&config, results, count))
 	{
 		free(results);
