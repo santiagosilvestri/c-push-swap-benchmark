@@ -4,7 +4,38 @@
 
 A single-file C benchmark that compares the available `--simple`, `--medium`, `--complex`, and `--adaptive` modes, validates their output, and displays the results as a terminal graph. It also works with standard `push_swap` programs that accept no strategy flags.
 
-## Use it in your Push Swap
+## One-command installation
+
+Once `install.sh` and `push_swap_benchmark.c` are published on this repository's `main` branch, users can paste this command:
+
+```bash
+bash -c 'ps_benchmark_installer=$(curl -fsSL https://raw.githubusercontent.com/santiagosilvestri/c-push-swap-benchmark/main/install.sh) && bash -c "$ps_benchmark_installer"'
+```
+
+It downloads the source, selects an available C compiler, builds the benchmark, installs it as `~/.local/bin/ps-benchmark`, and configures that directory in the user's Bash or Zsh startup files.
+
+**Paste it inside a folder containing an executable `./push_swap` and the benchmark starts automatically after installation.** Otherwise, it finishes installing and shows how to run it later:
+
+```bash
+ps-benchmark
+ps-benchmark -a complex, simple, medium -m 100 -r 3
+```
+
+If the command directory is new to your current shell, open a new terminal for future runs. The installer starts the first benchmark using its full path, so that first run does not require a terminal restart.
+
+The installer needs Bash and an existing C compiler (`cc`, `clang`, or `gcc`). Remote installation also needs a downloader; the command above uses `curl`. Installation takes place in the user's home directory and does not request administrator privileges. Unsupported shells receive instructions to add the command directory to `PATH`.
+
+After downloading the repository, local installation also works offline when the C source is beside the installer:
+
+```bash
+bash install.sh
+```
+
+Use `bash install.sh --no-run` to install without starting a benchmark, or `bash install.sh --run -m 100 -r 3` to install and run with custom benchmark options. Rerunning the installer updates the executable and keeps a single managed PATH block in each startup file. Downloads and compilation are staged before replacing an existing executable.
+
+The URL above becomes usable after these files are uploaded to GitHub. If the repository owner, name, or branch changes, update both the installation command and the source URL at the top of `install.sh`.
+
+## Use only the C file
 
 Place `push_swap_benchmark.c` in the same directory as your compiled `push_swap` executable:
 
@@ -349,6 +380,7 @@ The standalone repository only needs:
 ```text
 Push-Swap-Graph-Benchmark/
 ├── push_swap_benchmark.c
+├── install.sh
 ├── benchmark-preview.png
 └── README.md
 ```
