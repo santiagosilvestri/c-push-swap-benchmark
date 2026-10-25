@@ -12,23 +12,30 @@
 /*   Run:                                                                     */
 /*     ./ps_benchmark                                                         */
 /*     ./ps_benchmark --help                                                  */
+/*     ./ps_benchmark --test                                                  */
 /*                                                                            */
 /* ************************************************************************** */
 
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <poll.h>
+#include <regex.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -83,6 +90,12 @@ typedef struct s_config
     unsigned int    seed;
     unsigned int    rng_state;
     const char      *program;
+    int             test_mode;
+    int             timeout_set;
+    int             graph_options_set;
+    const char      *project_dir;
+    const char      *checker_path;
+    const char      *report_dir;
 }   t_config;
 
 typedef struct s_result
@@ -164,7 +177,7 @@ static void	fill_stop_signal_set(sigset_t *set)
 	sigaddset(set, SIGQUIT);
 }
 
-/* ===== benchmark_args.c ===== */
+/* ===== Argument parsing and usage ===== */
 
 static int	parse_number(const char *text, long minimum, long maximum,
 		long *value)
@@ -298,6 +311,21 @@ static int	set_integer_option(char **argv, int *i, int *target,
 
 static int	set_option(char **argv, int *i, t_config *config)
 {
+	if (strcmp(argv[*i], "--project") == 0
+		|| strcmp(argv[*i], "--checker") == 0
+		|| strcmp(argv[*i], "--report-dir") == 0)
+	{
+		if (!argv[*i + 1] || argv[*i + 1][0] == '\0')
+			return (0);
+		if (strcmp(argv[*i], "--project") == 0)
+			config->project_dir = argv[*i + 1];
+		else if (strcmp(argv[*i], "--checker") == 0)
+			config->checker_path = argv[*i + 1];
+		else
+			config->report_dir = argv[*i + 1];
+		(*i)++;
+		return (1);
+	}
 	if (is_option(argv[*i], "-b", "--program"))
 	{
 		if (!argv[*i + 1] || argv[*i + 1][0] == '\0')
@@ -316,8 +344,11 @@ static int	set_option(char **argv, int *i, t_config *config)
 	if (is_option(argv[*i], "-H", "--height"))
 		return (set_integer_option(argv, i, &config->chart_height, 8, 40));
 	if (is_option(argv[*i], "-t", "--timeout"))
+	{
+		config->timeout_set = 1;
 		return (set_integer_option(argv, i, &config->timeout_seconds, 1,
 				MAX_TIMEOUT));
+	}
 	if (is_option(argv[*i], "-d", "--disorder"))
 	{
 		if (!set_integer_option(argv, i, &config->disorder, 0, 100))
@@ -399,13 +430,28 @@ int	parse_config(int argc, char **argv, t_config *config)
 {
 	int	i;
 
-	*config = (t_config){500, 10, 3, 18, 0, 0, 0, DEFAULT_TIMEOUT,
-		MASK_ALL, (unsigned int)time(NULL), 0, "./push_swap"};
+	*config = (t_config){.max_n = 500, .samples = 10, .runs = 3,
+		.chart_height = 18, .timeout_seconds = DEFAULT_TIMEOUT,
+		.algorithms = MASK_ALL, .seed = (unsigned int)time(NULL),
+		.program = "./push_swap"};
 	i = 1;
 	while (i < argc)
 	{
 		if (is_option(argv[i], "-h", "--help"))
 			return (2);
+		if (is_option(argv[i], "--test", "-test"))
+		{
+			config->test_mode = 1;
+			i++;
+			continue ;
+		}
+		if (is_option(argv[i], "-m", "--max")
+			|| is_option(argv[i], "-p", "--samples")
+			|| is_option(argv[i], "-a", "--algorithms")
+			|| is_option(argv[i], "-d", "--disorder")
+			|| is_option(argv[i], "-H", "--height")
+			|| is_option(argv[i], "-l", "--log"))
+			config->graph_options_set = 1;
 		if (is_option(argv[i], "-l", "--log"))
 			config->log_scale = 1;
 		else if (i + 1 >= argc || !set_option(argv, &i, config))
@@ -416,7 +462,17 @@ int	parse_config(int argc, char **argv, t_config *config)
 	config->rng_state = config->seed;
 	if (config->rng_state == 0)
 		config->rng_state = 0x9e3779b9U;
-	if (access(config->program, X_OK) != 0)
+	if (config->test_mode && config->graph_options_set)
+		return (fprintf(stderr, "Error: --test uses fixed test sizes and all "
+			"required modes. Use -r, -s, -t, -b, --project, --checker or "
+			"--report-dir to customize it.\n"), 0);
+	if (!config->test_mode && (config->project_dir || config->checker_path
+			|| config->report_dir))
+		return (fprintf(stderr, "Error: source, checker and report options "
+			"require --test.\n"), 0);
+	if (config->test_mode && !config->timeout_set)
+		config->timeout_seconds = 5;
+	if (!config->test_mode && access(config->program, X_OK) != 0)
 		return (fprintf(stderr, "Error: %s was not found or is not "
 				"executable.\n", config->program), 0);
 	return (1);
@@ -435,6 +491,7 @@ static void	print_brief_usage(const char *program)
 void	print_usage(const char *program)
 {
 	printf("Usage: %s [options]\n", program);
+	printf("      %s --test [-b PATH] [test options]\n", program);
 	printf("  -b, --program PATH   Executable path (default: ./push_swap)\n");
 	printf("  -m, --max N          Maximum input size, 2-%d (default: 500)\n",
 		MAX_ELEMENTS);
@@ -455,9 +512,15 @@ void	print_usage(const char *program)
 		"(default: %d)\n", MAX_TIMEOUT, DEFAULT_TIMEOUT);
 	printf("  -s, --seed N         Reproducible unsigned random seed\n");
 	printf("  -h, --help           Show this help\n");
+	printf("  --test, -test        Run diagnostic tests instead of the graph\n");
+	printf("  --project DIR       Source root for isolated Makefile/Norm checks\n");
+	printf("  --checker PATH      Optional checker executable for bonus tests\n");
+	printf("  --report-dir DIR    Parent directory for a unique diagnostic report\n");
+	printf("  Test mode: -r repeats random cases (at least 3/2 for 100/500);\n");
+	printf("             -s reproduces inputs; -t defaults to 5 seconds per case.\n");
 }
 
-/* ===== benchmark_utils.c ===== */
+/* ===== Shared utilities and input generation ===== */
 
 int	selected_count(unsigned int mask)
 {
@@ -726,7 +789,7 @@ double	measure_disorder(int *values, int size)
 	return ((double)inversions * 100.0 / (double)maximum);
 }
 
-/* ===== benchmark_verify.c ===== */
+/* ===== Shared operation simulator and output validation ===== */
 
 typedef struct s_sim_stack
 {
@@ -980,6 +1043,8 @@ static int	wait_for_child(pid_t pid, int *status, int timeout_seconds,
 		result = waitpid(pid, status, WNOHANG);
 		if (result == pid)
 		{
+			/* A wrapper may leave descendants after closing its output. */
+			kill(-pid, SIGKILL);
 			g_active_child_pid = 0;
 			if (sigprocmask(SIG_SETMASK, &previous_mask, NULL) < 0)
 				return (0);
@@ -1029,7 +1094,7 @@ int	verify_push_swap_output(int fd, pid_t pid, int *values, int size,
 	return (operations);
 }
 
-/* ===== benchmark_exec.c ===== */
+/* ===== Graph mode: child execution and strategy detection ===== */
 
 static char	**build_arguments(int algorithm, int *values, int size,
 		char **storage, const char *program)
@@ -1253,7 +1318,7 @@ static int	detect_algorithms(t_config *config)
 	return (1);
 }
 
-/* ===== benchmark_progress.c ===== */
+/* ===== Graph mode: progress display ===== */
 
 static void	print_progress_bar(t_progress *progress, int percent)
 {
@@ -1368,7 +1433,7 @@ void	progress_abort(t_progress *progress)
 	fflush(stdout);
 }
 
-/* ===== benchmark_terminal.c ===== */
+/* ===== Graph mode: terminal chart and statistics display ===== */
 
 static int	terminal_width(void)
 {
@@ -1855,7 +1920,7 @@ void	write_terminal_chart(t_config *config, t_result *results, int count)
 	print_performance_rating(config, &results[count - 1]);
 }
 
-/* ===== benchmark.c ===== */
+/* ===== Graph mode: measurements and statistics ===== */
 
 static int	result_count(t_config *config)
 {
@@ -2056,6 +2121,1399 @@ static int	run_benchmark(t_config *config, t_result *results, int count)
 	return (1);
 }
 
+/* ===== Optional diagnostic test suite (independent of graph mode) ===== */
+
+#ifndef PATH_MAX
+# define PATH_MAX 4096
+#endif
+#define TEST_CAPTURE_LIMIT (8 * 1024 * 1024)
+#define TEST_OK 0
+#define TEST_KO 1
+#define TEST_SKIP 2
+#define TEST_INFO 3
+
+typedef struct s_test_suite
+{
+	t_config *config;
+	char root[PATH_MAX];
+	char project[PATH_MAX];
+	char program[PATH_MAX];
+	char checker[PATH_MAX];
+	char sandbox[PATH_MAX];
+	FILE *report;
+	int number;
+	int counts[4];
+	int section_before[4];
+	int infrastructure_error;
+	int consecutive_timeouts;
+	t_config random;
+} t_test_suite;
+
+typedef struct s_test_case
+{
+	int number;
+	char name[160];
+	char stem[PATH_MAX];
+	FILE *trace;
+	int status;
+	int runtime;
+	long long duration;
+	char *out;
+	char *err;
+	size_t out_size;
+	size_t err_size;
+	char reason[1024];
+} t_test_case;
+
+static int ts_join(char *dest, size_t size, const char *a, const char *b)
+{
+	int n = snprintf(dest, size, "%s/%s", a, b);
+	if (n < 0 || (size_t)n >= size) { errno = ENAMETOOLONG; return (0); }
+	return (1);
+}
+
+static int ts_regular(const char *path)
+{
+	struct stat st;
+	return (stat(path, &st) == 0 && S_ISREG(st.st_mode));
+}
+
+static int ts_absolute(const char *path, char *dest, size_t size)
+{
+	char cwd[PATH_MAX];
+	int n;
+	if (path[0] == '/')
+		n = snprintf(dest, size, "%s", path);
+	else
+	{
+		if (!getcwd(cwd, sizeof(cwd)))
+			return (0);
+		n = snprintf(dest, size, "%s/%s", cwd, path);
+	}
+	if (n < 0 || (size_t)n >= size) { errno = ENAMETOOLONG; return (0); }
+	return (1);
+}
+
+static int ts_mkdirs(const char *path)
+{
+	char copy[PATH_MAX];
+	struct stat st;
+	size_t i;
+	if (strlen(path) >= sizeof(copy))
+		return (errno = ENAMETOOLONG, 0);
+	strcpy(copy, path);
+	i = 1;
+	while (1)
+	{
+		if (copy[i] == '/' || copy[i] == '\0')
+		{
+			char saved = copy[i];
+			copy[i] = '\0';
+			if (mkdir(copy, 0700) < 0 && errno != EEXIST)
+				return (0);
+			if (stat(copy, &st) < 0) return (0);
+			if (!S_ISDIR(st.st_mode)) return (errno = ENOTDIR, 0);
+			copy[i] = saved;
+			if (!saved)
+				break ;
+		}
+		i++;
+	}
+	return (1);
+}
+
+static void ts_quote(FILE *file, const char *text)
+{
+	fputc('\'', file);
+	while (*text)
+	{
+		if (*text == '\'')
+			fputs("'\\''", file);
+		else
+			fputc(*text, file);
+		text++;
+	}
+	fputc('\'', file);
+}
+
+static void ts_preview(FILE *file, const char *data, size_t size)
+{
+	size_t i;
+	fputc('"', file);
+	for (i = 0; i < size && i < 240; i++)
+	{
+		unsigned char c = (unsigned char)data[i];
+		if (c == '\n') fputs("\\n", file);
+		else if (c == '\r') fputs("\\r", file);
+		else if (c == '\t') fputs("\\t", file);
+		else if (c == '"' || c == '\\') fprintf(file, "\\%c", c);
+		else if (c < 32 || c > 126) fprintf(file, "\\x%02x", c);
+		else fputc(c, file);
+	}
+	if (i < size) fputs("...", file);
+	fputc('"', file);
+}
+
+static FILE *ts_open(const char *path, const char *mode)
+{
+	FILE *file = fopen(path, mode);
+	if (file)
+		fcntl(fileno(file), F_SETFD, FD_CLOEXEC);
+	return (file);
+}
+
+static char *ts_read(const char *path, size_t *size)
+{
+	FILE *file = ts_open(path, "rb");
+	char *data;
+	long length;
+	*size = 0;
+	if (!file || fseek(file, 0, SEEK_END) != 0)
+	{
+		if (file) fclose(file);
+		return (NULL);
+	}
+	length = ftell(file);
+	if (length < 0 || length > TEST_CAPTURE_LIMIT || fseek(file, 0, SEEK_SET))
+		return (fclose(file), NULL);
+	data = malloc((size_t)length + 1);
+	if (!data) return (fclose(file), NULL);
+	*size = fread(data, 1, (size_t)length, file);
+	if (*size != (size_t)length || ferror(file))
+		return (free(data), fclose(file), NULL);
+	data[*size] = '\0';
+	fclose(file);
+	return (data);
+}
+
+/* Keep ANSI escapes out of redirected output and saved reports. */
+static void ts_print_status(const char *label)
+{
+	const char *color = "";
+	const char *term = getenv("TERM");
+	if (isatty(STDOUT_FILENO) && !getenv("NO_COLOR")
+		&& (!term || strcmp(term, "dumb")))
+	{
+		if (!strcmp(label, "OK")) color = "\033[32m";
+		else if (!strcmp(label, "KO")) color = "\033[31m";
+	}
+	printf("%s[ %s ]%s", color, label, *color ? "\033[0m" : "");
+}
+
+static void ts_section(t_test_suite *suite, const char *name)
+{
+	int i;
+	printf("\n-- %s --\n", name);
+	fprintf(suite->report, "\n-- %s --\n", name);
+	for (i = 0; i < 4; i++) suite->section_before[i] = suite->counts[i];
+}
+
+static void ts_section_end(t_test_suite *suite)
+{
+	int ok = suite->counts[TEST_OK] - suite->section_before[TEST_OK];
+	int ko = suite->counts[TEST_KO] - suite->section_before[TEST_KO];
+	int skip = suite->counts[TEST_SKIP] - suite->section_before[TEST_SKIP];
+	const char *state = ko ? "KO" : (skip ? "INCOMPLETE" : "OK");
+	printf("Section "); ts_print_status(state);
+	printf(": %d OK, %d KO, %d SKIP\n", ok, ko, skip);
+	fprintf(suite->report, "Section [%s]: %d OK, %d KO, %d SKIP\n", state, ok, ko, skip);
+	fflush(suite->report);
+}
+
+static int ts_begin(t_test_suite *suite, t_test_case *test,
+		const char *name, const char *expected)
+{
+	char file[PATH_MAX];
+	int n;
+	memset(test, 0, sizeof(*test));
+	test->number = ++suite->number;
+	snprintf(test->name, sizeof(test->name), "%s", name);
+	n = snprintf(test->stem, sizeof(test->stem), "%s/T%04d", suite->root, test->number);
+	if (n < 0 || (size_t)n >= sizeof(test->stem)
+		|| snprintf(file, sizeof(file), "%s.details.txt", test->stem) >= (int)sizeof(file))
+		return (suite->infrastructure_error = 1, 0);
+	test->trace = ts_open(file, "w");
+	if (!test->trace) return (suite->infrastructure_error = 1, 0);
+	fprintf(test->trace, "T%04d %s\nSeed: %u\nExpected: %s\n", test->number, name, suite->config->seed, expected);
+	fflush(stdout);
+	return (1);
+}
+
+static void ts_finish(t_test_suite *suite, t_test_case *test, int state,
+		const char *format, ...)
+{
+	static const char *states[] = {"OK", "KO", "SKIP", "INFO"};
+	char message[2048];
+	va_list args;
+	va_start(args, format);
+	vsnprintf(message, sizeof(message), format, args);
+	va_end(args);
+	if (test->runtime == -5 && state == TEST_KO) state = TEST_SKIP;
+	suite->counts[state]++;
+	ts_print_status(states[state]);
+	printf(" T%04d %s: %s\n", test->number, test->name, message);
+	fprintf(suite->report, "[%s] T%04d %s: %s\n  Details: %s.details.txt\n",
+		states[state], test->number, test->name, message, test->stem);
+	if (test->trace)
+	{
+		fprintf(test->trace, "\nResult: %s\nDiagnosis: %s\n", states[state], message);
+		int failed = ferror(test->trace);
+		if (fclose(test->trace)) failed = 1;
+		if (failed) suite->infrastructure_error = 1;
+		test->trace = NULL;
+	}
+	if (state == TEST_KO)
+	{
+		char command[PATH_MAX];
+		printf("  Details: %s.details.txt\n", test->stem);
+		if (snprintf(command, sizeof(command), "%s.command.sh", test->stem) < (int)sizeof(command)
+			&& ts_regular(command))
+		{
+			printf("  Reproduce: sh "); ts_quote(stdout, command); printf("\n");
+		}
+	}
+	free(test->out); free(test->err);
+	test->out = NULL; test->err = NULL;
+	if (fflush(suite->report) || ferror(stdout)) suite->infrastructure_error = 1;
+}
+
+static void ts_notice(t_test_suite *suite, const char *name, int state, const char *message)
+{
+	t_test_case test;
+	if (ts_begin(suite, &test, name, message)) ts_finish(suite, &test, state, "%s", message);
+}
+
+static int ts_wait(pid_t pid, int *status, int out_fd, int err_fd,
+		int seconds, struct timespec *start)
+{
+	struct timespec pause = {0, 10000000L};
+	struct stat out_st, err_st;
+	sigset_t set, previous;
+	int reason = 0;
+	pid_t result;
+	fill_stop_signal_set(&set);
+	while (1)
+	{
+		if (g_stop_signal) reason = -4;
+		else if (elapsed_milliseconds(start) > seconds * 1000LL) reason = -2;
+		else if (fstat(out_fd, &out_st) || fstat(err_fd, &err_st)) reason = -1;
+		else if (out_st.st_size > TEST_CAPTURE_LIMIT || err_st.st_size > TEST_CAPTURE_LIMIT) reason = -3;
+		if (reason) kill_child_processes(pid);
+		if (sigprocmask(SIG_BLOCK, &set, &previous) < 0)
+		{
+			kill_child_processes(pid);
+			do result = waitpid(pid, status, 0); while (result < 0 && errno == EINTR);
+			g_active_child_pid = 0;
+			return (-1);
+		}
+		result = waitpid(pid, status, reason ? 0 : WNOHANG);
+		if (result == pid || (result < 0 && errno != EINTR))
+		{
+			g_active_child_pid = 0;
+			sigprocmask(SIG_SETMASK, &previous, NULL);
+			/* Also stop descendants that outlive their direct parent. */
+			kill(-pid, SIGKILL);
+			return (result == pid ? reason : -1);
+		}
+		sigprocmask(SIG_SETMASK, &previous, NULL);
+		nanosleep(&pause, NULL);
+	}
+}
+
+static int ts_capture(t_test_suite *suite, t_test_case *test, char *const args[],
+		const char *input, const char *cwd, int seconds)
+{
+	char in_path[PATH_MAX], out_path[PATH_MAX], err_path[PATH_MAX], command_path[PATH_MAX];
+	FILE *file;
+	int in_fd = -1, out_fd = -1, err_fd = -1;
+	int i;
+	pid_t pid;
+	struct timespec start;
+	sigset_t set, previous;
+	if (snprintf(in_path, sizeof(in_path), "%s.stdin.txt", test->stem) >= (int)sizeof(in_path)
+		|| snprintf(out_path, sizeof(out_path), "%s.stdout", test->stem) >= (int)sizeof(out_path)
+		|| snprintf(err_path, sizeof(err_path), "%s.stderr", test->stem) >= (int)sizeof(err_path)
+		|| snprintf(command_path, sizeof(command_path), "%s.command.sh", test->stem) >= (int)sizeof(command_path))
+		goto failure;
+	file = ts_open(in_path, "w");
+	if (!file) goto failure;
+	int write_failed = fputs(input ? input : "", file) == EOF;
+	if (fclose(file)) write_failed = 1;
+	if (write_failed) goto failure;
+	file = ts_open(command_path, "w");
+	if (!file) goto failure;
+	fputs("#!/bin/sh\ncd ", file); ts_quote(file, cwd); fputs(" || exit 1\n", file);
+	for (i = 0; args[i]; i++) { if (i) fputc(' ', file); ts_quote(file, args[i]); }
+	fputs(" < ", file); ts_quote(file, in_path); fputc('\n', file);
+	if (fclose(file)) goto failure;
+	fprintf(test->trace, "Working directory: %s\nReplay: sh %s\nCommand: ", cwd, command_path);
+	for (i = 0; args[i]; i++) { if (i) fputc(' ', test->trace); ts_quote(test->trace, args[i]); }
+	fprintf(test->trace, "\nstdin: %s\nstdout: %s\nstderr: %s\n", in_path, out_path, err_path);
+	fflush(test->trace);
+	in_fd = open(in_path, O_RDONLY);
+	out_fd = open(out_path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+	err_fd = open(err_path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+	if (in_fd < 0 || out_fd < 0 || err_fd < 0 || clock_gettime(CLOCK_MONOTONIC, &start)) goto failure;
+	if (suite->consecutive_timeouts >= 3)
+	{
+		close(in_fd); close(out_fd); close(err_fd);
+		test->runtime = -5;
+		test->out = strdup(""); test->err = strdup("");
+		if (!test->out || !test->err) suite->infrastructure_error = 1;
+		snprintf(test->reason, sizeof(test->reason), "not executed after three consecutive timeouts; fix the hang or increase -t, then rerun this saved command");
+		fputs("Process: NOT RUN (three-timeout circuit breaker)\n", test->trace);
+		return (0);
+	}
+	fill_stop_signal_set(&set);
+	if (sigprocmask(SIG_BLOCK, &set, &previous)) goto failure;
+	pid = fork();
+	if (pid == 0)
+	{
+		struct rlimit no_core = {0, 0};
+		setrlimit(RLIMIT_CORE, &no_core);
+		if (setpgid(0, 0) || chdir(cwd) || dup2(in_fd, STDIN_FILENO) < 0
+			|| dup2(out_fd, STDOUT_FILENO) < 0 || dup2(err_fd, STDERR_FILENO) < 0) _exit(126);
+		close(in_fd); close(out_fd); close(err_fd);
+		sigprocmask(SIG_SETMASK, &previous, NULL);
+		execvp(args[0], args);
+		dprintf(STDERR_FILENO, "Could not execute %s: %s\n", args[0], strerror(errno));
+		_exit(127);
+	}
+	if (pid < 0)
+	{
+		sigprocmask(SIG_SETMASK, &previous, NULL);
+		goto failure;
+	}
+	if (setpgid(pid, pid) < 0 && errno != EACCES && errno != ESRCH)
+	{
+		kill(pid, SIGKILL);
+		while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) ;
+		sigprocmask(SIG_SETMASK, &previous, NULL);
+		goto failure;
+	}
+	g_active_child_pid = (sig_atomic_t)pid;
+	if (sigprocmask(SIG_SETMASK, &previous, NULL))
+	{
+		kill_child_processes(pid);
+		while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) ;
+		g_active_child_pid = 0;
+		goto failure;
+	}
+	test->runtime = ts_wait(pid, &test->status, out_fd, err_fd, seconds, &start);
+	if (test->runtime == -2) suite->consecutive_timeouts++;
+	else suite->consecutive_timeouts = 0;
+	if (suite->consecutive_timeouts == 3)
+	{
+		printf("Three consecutive timeouts: remaining subprocess cases will be SKIP.\n");
+		fprintf(suite->report, "Three consecutive timeouts: remaining subprocess cases will be SKIP.\n");
+	}
+	test->duration = elapsed_milliseconds(&start);
+	struct stat observed_out = {0}, observed_err = {0};
+	fstat(out_fd, &observed_out); fstat(err_fd, &observed_err);
+	close(in_fd); close(out_fd); close(err_fd);
+	test->out = ts_read(out_path, &test->out_size);
+	test->err = ts_read(err_path, &test->err_size);
+	if (!test->out && observed_out.st_size > 0) test->out_size = (size_t)observed_out.st_size;
+	if (!test->err && observed_err.st_size > 0) test->err_size = (size_t)observed_err.st_size;
+	if (test->runtime == -2) snprintf(test->reason, sizeof(test->reason), "timeout after %d seconds", seconds);
+	else if (test->runtime == -3) snprintf(test->reason, sizeof(test->reason), "stdout or stderr exceeded %d bytes", TEST_CAPTURE_LIMIT);
+	else if (test->runtime == -4) snprintf(test->reason, sizeof(test->reason), "interrupted by signal %d", (int)g_stop_signal);
+	else if (test->runtime < 0) snprintf(test->reason, sizeof(test->reason), "could not monitor child process");
+	else if (WIFSIGNALED(test->status)) snprintf(test->reason, sizeof(test->reason), "terminated by signal %d", WTERMSIG(test->status));
+	else if (!WIFEXITED(test->status)) snprintf(test->reason, sizeof(test->reason), "child did not exit normally");
+	else if (!test->out || !test->err) snprintf(test->reason, sizeof(test->reason), "could not read captured output");
+	fprintf(test->trace, "Elapsed: %lld ms\nProcess: ", test->duration);
+	if (WIFEXITED(test->status)) fprintf(test->trace, "exit %d\n", WEXITSTATUS(test->status));
+	else if (WIFSIGNALED(test->status)) fprintf(test->trace, "signal %d\n", WTERMSIG(test->status));
+	else fputs("unknown state\n", test->trace);
+	fprintf(test->trace, "stdout bytes: %zu\nstdout preview: ", test->out_size);
+	if (test->out) ts_preview(test->trace, test->out, test->out_size);
+	fprintf(test->trace, "\nstderr bytes: %zu\nstderr preview: ", test->err_size);
+	if (test->err) ts_preview(test->trace, test->err, test->err_size);
+	fputc('\n', test->trace);
+	return (test->reason[0] == '\0');
+failure:
+	if (in_fd >= 0) close(in_fd);
+	if (out_fd >= 0) close(out_fd);
+	if (err_fd >= 0) close(err_fd);
+	suite->infrastructure_error = 1;
+	snprintf(test->reason, sizeof(test->reason), "tester infrastructure error: %s", strerror(errno));
+	return (0);
+}
+
+static int ts_success(t_test_case *test)
+{
+	if (test->reason[0]) return (0);
+	if (!WIFEXITED(test->status) || WEXITSTATUS(test->status) != 0)
+	{
+		snprintf(test->reason, sizeof(test->reason), "expected exit 0, received exit %d", WEXITSTATUS(test->status));
+		return (0);
+	}
+	return (1);
+}
+
+static int ts_equal(const char *data, size_t size, const char *expected)
+{
+	return (data && size == strlen(expected) && memcmp(data, expected, size) == 0);
+}
+
+static void ts_stack_dump(FILE *file, t_sim_stack *stack, const char *label)
+{
+	int i;
+	fprintf(file, "%s (%d):", label, stack->size);
+	for (i = 0; i < stack->size; i++) fprintf(file, " %d", stack->data[stack_index(stack, i)]);
+	fputc('\n', file);
+}
+
+static int ts_sort_output(t_test_case *test, int *values, int size,
+		int maximum, int allow_stderr)
+{
+	t_verifier verifier;
+	size_t i, line = 1;
+	int valid = 1;
+	if (!ts_success(test)) return (-1);
+	if (!allow_stderr && test->err_size)
+	{
+		snprintf(test->reason, sizeof(test->reason), "unexpected stderr (%zu bytes); see captured stderr", test->err_size);
+		return (-1);
+	}
+	if (!verifier_init(&verifier, values, size))
+	{
+		snprintf(test->reason, sizeof(test->reason), "tester could not allocate stack verifier");
+		return (-1);
+	}
+	for (i = 0; i < test->out_size; i++)
+	{
+		if (!feed_character(&verifier, test->out[i]))
+		{
+			snprintf(test->reason, sizeof(test->reason), "invalid operation at stdout line %zu, byte %zu (0x%02x); accepted operations: %d",
+				line, i + 1, (unsigned char)test->out[i], verifier.operations);
+			valid = 0; break ;
+		}
+		if (test->out[i] == '\n') line++;
+	}
+	if (valid && verifier.line_length)
+	{
+		snprintf(test->reason, sizeof(test->reason), "stdout line %zu is missing its final newline", line);
+		valid = 0;
+	}
+	if (valid && !verifier_is_sorted(&verifier))
+	{
+		int inversion = -1;
+		for (int j = 1; j < verifier.a.size; j++)
+			if (verifier.a.data[stack_index(&verifier.a, j - 1)] > verifier.a.data[stack_index(&verifier.a, j)]) { inversion = j; break ; }
+		snprintf(test->reason, sizeof(test->reason), "incorrect final stacks after %d operations: A=%d, B=%d; first inversion in A at index %d (-1 means none)",
+			verifier.operations, verifier.a.size, verifier.b.size, inversion);
+		valid = 0;
+	}
+	if (valid && maximum >= 0 && verifier.operations > maximum)
+	{
+		snprintf(test->reason, sizeof(test->reason), "sorting is correct but used %d operations; maximum accepted for this case is %d", verifier.operations, maximum);
+		valid = 0;
+	}
+	fprintf(test->trace, "Operations parsed: %d\n", verifier.operations);
+	ts_stack_dump(test->trace, &verifier.a, "Final A");
+	ts_stack_dump(test->trace, &verifier.b, "Final B");
+	int operations = verifier.operations;
+	free(verifier.a.data); free(verifier.b.data);
+	return (valid ? operations : -1);
+}
+
+static char **ts_arguments(const char *program, int algorithm, int bench,
+		int *values, int size, char **storage)
+{
+	char **args = malloc(sizeof(*args) * ((size_t)size + 5));
+	int offset = 1;
+	*storage = malloc((size_t)(size ? size : 1) * 16);
+	if (!args || !*storage)
+	{
+		free(args); free(*storage); *storage = NULL;
+		return (NULL);
+	}
+	args[0] = (char *)program;
+	if (bench) args[offset++] = "--bench";
+	if (algorithm != ALG_DEFAULT) args[offset++] = (char *)algorithm_flag(algorithm);
+	for (int i = 0; i < size; i++)
+	{
+		snprintf(*storage + i * 16, 16, "%d", values[i]);
+		args[offset++] = *storage + i * 16;
+	}
+	args[offset] = NULL;
+	return (args);
+}
+
+static int ts_sort_case(t_test_suite *suite, const char *name, int algorithm,
+		int *values, int size, int maximum)
+{
+	t_test_case test;
+	char expectation[160], *storage = NULL, **args;
+	int count = -1;
+	snprintf(expectation, sizeof(expectation), "exit 0; empty stderr; valid operations sorting %d values; maximum operations %d (-1 = unlimited)", size, maximum);
+	if (!ts_begin(suite, &test, name, expectation)) return (-1);
+	args = ts_arguments(suite->program, algorithm, 0, values, size, &storage);
+	if (!args)
+	{
+		suite->infrastructure_error = 1;
+		snprintf(test.reason, sizeof(test.reason), "tester allocation failed");
+	}
+	else if (ts_capture(suite, &test, args, "", suite->project, suite->config->timeout_seconds))
+		count = ts_sort_output(&test, values, size, maximum, 0);
+	if (count >= 0) ts_finish(suite, &test, TEST_OK, "%d operations; final A sorted and B empty", count);
+	else ts_finish(suite, &test, TEST_KO, "%s", test.reason);
+	free(args); free(storage);
+	return (count);
+}
+
+static int ts_exact_case(t_test_suite *suite, const char *name, char *const args[],
+		const char *input, const char *out, const char *err, int require_zero)
+{
+	t_test_case test;
+	int ok;
+	if (!ts_begin(suite, &test, name, "exact stdout/stderr (recorded below); normal exit; no timeout or crash")) return (0);
+	fputs("Expected stdout: ", test.trace); ts_preview(test.trace, out, strlen(out));
+	fputs("\nExpected stderr: ", test.trace); ts_preview(test.trace, err, strlen(err)); fputc('\n', test.trace);
+	ok = ts_capture(suite, &test, args, input, suite->project, suite->config->timeout_seconds);
+	if (ok && require_zero) ok = ts_success(&test);
+	if (ok && !ts_equal(test.out, test.out_size, out))
+	{
+		snprintf(test.reason, sizeof(test.reason), "stdout mismatch: expected %zu bytes, got %zu; inspect expected/actual previews and .stdout", strlen(out), test.out_size);
+		ok = 0;
+	}
+	if (ok && !ts_equal(test.err, test.err_size, err))
+	{
+		snprintf(test.reason, sizeof(test.reason), "stderr mismatch: expected %zu bytes, got %zu; expected diagnostics must be on stderr", strlen(err), test.err_size);
+		ok = 0;
+	}
+	ts_finish(suite, &test, ok ? TEST_OK : TEST_KO, "%s", ok ? "stdout, stderr and process termination match" : test.reason);
+	return (ok);
+}
+
+static int ts_find_tool(const char *name, char *dest, size_t size)
+{
+	const char *path = getenv("PATH");
+	char copy[PATH_MAX * 2], candidate[PATH_MAX], *cursor, *end;
+	if (!path || strlen(path) >= sizeof(copy)) return (0);
+	strcpy(copy, path); cursor = copy;
+	while (cursor)
+	{
+		end = strchr(cursor, ':'); if (end) *end = '\0';
+		if (ts_join(candidate, sizeof(candidate), *cursor ? cursor : ".", name)
+			&& ts_regular(candidate) && access(candidate, X_OK) == 0)
+			return (ts_absolute(candidate, dest, size));
+		cursor = end ? end + 1 : NULL;
+	}
+	return (0);
+}
+
+static void ts_error_tests(t_test_suite *suite)
+{
+	const char *vectors[][5] = {
+		{"not-a-number", "4", NULL}, {"7", "-2", "7", NULL},
+		{"2147483648", NULL}, {"-2147483649", NULL},
+		{"999999999999999999999999999999", NULL},
+		{"", NULL}, {"   ", NULL}, {"+", NULL}, {"--", NULL},
+		{"2.5", NULL}, {"3x", NULL}, {"+0", "-0", NULL}
+	};
+	const char *names[] = {"non-numeric token", "duplicate integer", "above INT_MAX",
+		"below INT_MIN", "very long overflow", "empty argument", "blank argument",
+		"isolated plus", "invalid minus token", "decimal token", "numeric suffix", "equivalent zero duplicates"};
+	char *args[8];
+	ts_section(suite, "Input validation");
+	for (size_t i = 0; i < sizeof(names) / sizeof(*names) && !g_stop_signal; i++)
+	{
+		int j = 0; args[0] = suite->program;
+		while (vectors[i][j]) { args[j + 1] = (char *)vectors[i][j]; j++; }
+		args[j + 1] = NULL;
+		ts_exact_case(suite, names[i], args, "", "", "Error\n", 0);
+	}
+	args[0] = suite->program; args[1] = NULL;
+	if (!g_stop_signal) ts_exact_case(suite, "no arguments", args, "", "", "", 1);
+	ts_section_end(suite);
+}
+
+static void ts_identity_tests(t_test_suite *suite)
+{
+	int values[10];
+	const int sizes[] = {1, 2, 4, 10};
+	char name[100];
+	ts_section(suite, "Already sorted inputs");
+	for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes) && !g_stop_signal; i++)
+	{
+		for (int j = 0; j < sizes[i]; j++) values[j] = j * 7 - 21;
+		snprintf(name, sizeof(name), "sorted input, %d elements", sizes[i]);
+		ts_sort_case(suite, name, ALG_DEFAULT, values, sizes[i], 0);
+	}
+	ts_section_end(suite);
+}
+
+static void ts_permutations(t_test_suite *suite, int *values, int size, int at, int *number)
+{
+	if (g_stop_signal || suite->infrastructure_error) return ;
+	if (at == size)
+	{
+		char name[100];
+		snprintf(name, sizeof(name), "%d elements, permutation %d", size, ++(*number));
+		ts_sort_case(suite, name, ALG_DEFAULT, values, size, size == 3 ? 5 : 15);
+		return ;
+	}
+	for (int i = at; i < size; i++)
+	{
+		int tmp = values[at]; values[at] = values[i]; values[i] = tmp;
+		ts_permutations(suite, values, size, at + 1, number);
+		tmp = values[at]; values[at] = values[i]; values[i] = tmp;
+		if (g_stop_signal || suite->infrastructure_error) break ;
+	}
+}
+
+static void ts_small_tests(t_test_suite *suite)
+{
+	int three[] = {-9, 0, 14}, five[] = {-11, -3, 2, 8, 21};
+	int number = 0;
+	int bounds[] = {INT_MAX, 0, INT_MIN, -1, 1};
+	int quoted[] = {8, -4, 0, 3};
+	char *quoted_args[] = {suite->program, "8 -4 0 3", NULL};
+	t_test_case test;
+	int count;
+	ts_section(suite, "Small inputs and operation budgets");
+	ts_permutations(suite, three, 3, 0, &number);
+	number = 0; ts_permutations(suite, five, 5, 0, &number);
+	if (!g_stop_signal) ts_sort_case(suite, "integer boundaries and mixed signs", ALG_DEFAULT, bounds, 5, -1);
+	if (!g_stop_signal && ts_begin(suite, &test, "single quoted numeric argument", "exit 0 and operations sorting the four supplied integers"))
+	{
+		count = -1;
+		if (ts_capture(suite, &test, quoted_args, "", suite->project, suite->config->timeout_seconds))
+			count = ts_sort_output(&test, quoted, 4, -1, 0);
+		ts_finish(suite, &test, count >= 0 ? TEST_OK : TEST_KO, "%s", count >= 0 ? "quoted list sorted correctly" : test.reason);
+	}
+	ts_section_end(suite);
+}
+
+static int ts_random_values(t_test_suite *suite, int *values, int size, int universe)
+{
+	int *pool = malloc(sizeof(int) * (size_t)universe);
+	if (!pool) return (suite->infrastructure_error = 1, 0);
+	for (int i = 0; i < universe; i++) pool[i] = i + 1;
+	for (int i = 0; i < size; i++)
+	{
+		int j = i + (int)random_bounded(&suite->random, (unsigned int)(universe - i));
+		int tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+		values[i] = pool[i];
+	}
+	free(pool);
+	return (1);
+}
+
+static void ts_strategy_tests(t_test_suite *suite)
+{
+	int reverse[] = {19, 13, 7, 2, -5};
+	int values[50];
+	int counts[4];
+	char name[120];
+	ts_section(suite, "Required strategy flags");
+	for (int a = 0; a < ALG_DEFAULT && !g_stop_signal; a++)
+	{
+		snprintf(name, sizeof(name), "%s on reverse input", algorithm_flag(a));
+		ts_sort_case(suite, name, a, reverse, 5, -1);
+	}
+	if (!g_stop_signal) ts_sort_case(suite, "unflagged execution", ALG_DEFAULT, reverse, 5, -1);
+	if (!g_stop_signal && ts_random_values(suite, values, 50, 200))
+	{
+		for (int a = 0; a < ALG_DEFAULT && !g_stop_signal; a++)
+		{
+			snprintf(name, sizeof(name), "%s on the same 50-element input", algorithm_flag(a));
+			counts[a] = ts_sort_case(suite, name, a, values, 50, -1);
+		}
+		if (!g_stop_signal)
+		{
+			char info[200];
+			snprintf(info, sizeof(info), "Observed counts: simple=%d, medium=%d, complex=%d, adaptive=%d (-1 = failed). Relative counts are informational, not a proof of complexity.", counts[0], counts[1], counts[2], counts[3]);
+			ts_notice(suite, "strategy performance comparison", TEST_INFO, info);
+		}
+	}
+	if (!g_stop_signal && !suite->infrastructure_error)
+	{
+		char *storage_a = NULL, *storage_b = NULL, **a, **b;
+		t_test_case test_a, test_b;
+		char *saved = NULL;
+		size_t saved_size = 0;
+		int ok_a = 0, ok_b = 0;
+		if (ts_begin(suite, &test_a, "default strategy observation on 50 elements", "valid default output; comparison with explicit adaptive follows"))
+		{
+			a = ts_arguments(suite->program, ALG_DEFAULT, 0, values, 50, &storage_a);
+			if (!a) { suite->infrastructure_error = 1; snprintf(test_a.reason, sizeof(test_a.reason), "tester allocation failed"); }
+			if (a && ts_capture(suite, &test_a, a, "", suite->project, suite->config->timeout_seconds)
+				&& ts_sort_output(&test_a, values, 50, -1, 0) >= 0)
+			{
+				ok_a = 1; saved_size = test_a.out_size;
+				saved = malloc(saved_size + 1);
+				if (saved) memcpy(saved, test_a.out, saved_size + 1);
+				else suite->infrastructure_error = 1;
+			}
+			ts_finish(suite, &test_a, ok_a ? TEST_OK : TEST_KO, "%s", ok_a ? "default output captured for comparison" : test_a.reason);
+			free(a); free(storage_a);
+		}
+		if (!g_stop_signal && ts_begin(suite, &test_b, "default versus adaptive output", "same valid operations for a deterministic default/adaptive implementation"))
+		{
+			b = ts_arguments(suite->program, ALG_ADAPTIVE, 0, values, 50, &storage_b);
+			if (!b) { suite->infrastructure_error = 1; snprintf(test_b.reason, sizeof(test_b.reason), "tester allocation failed"); }
+			if (b && ts_capture(suite, &test_b, b, "", suite->project, suite->config->timeout_seconds)
+				&& ts_sort_output(&test_b, values, 50, -1, 0) >= 0) ok_b = 1;
+			if (!ok_b) ts_finish(suite, &test_b, TEST_KO, "%s", test_b.reason);
+			else if (saved && test_b.out_size == saved_size && !memcmp(saved, test_b.out, saved_size))
+				ts_finish(suite, &test_b, TEST_OK, "default and adaptive produced identical operations on this input; equality is an observation on this case only");
+			else ts_finish(suite, &test_b, TEST_INFO, "valid outputs differ or the reference failed; comparison is observational and does not establish internal strategy selection");
+			free(b); free(storage_b);
+		}
+		free(saved);
+	}
+	ts_section_end(suite);
+}
+
+static void ts_large_tests(t_test_suite *suite)
+{
+	int values[500];
+	char name[100];
+	int runs;
+	ts_section(suite, "Random input correctness and per-run operation budgets");
+	for (int size = 100; size <= 500 && !g_stop_signal; size += 400)
+	{
+		runs = suite->config->runs;
+		if (runs < (size == 100 ? 3 : 2)) runs = size == 100 ? 3 : 2;
+		for (int i = 0; i < runs && !g_stop_signal; i++)
+		{
+			if (!ts_random_values(suite, values, size, size == 100 ? 500 : 1000)) break ;
+			snprintf(name, sizeof(name), "%d elements, random run %d", size, i + 1);
+			ts_sort_case(suite, name, ALG_DEFAULT, values, size, size == 100 ? 1999 : 11999);
+		}
+	}
+	ts_section_end(suite);
+}
+
+/* Recognize common text labels without requiring one exact presentation. */
+static int ts_metric(const char *data, const char *wanted, double *value)
+{
+	const char *line = data;
+	while (line && *line)
+	{
+		const char *end = strchr(line, '\n');
+		const char *label = line, *sep, *bracket;
+		char key[100]; size_t k = 0;
+		if (!end) end = line + strlen(line);
+		bracket = memchr(line, ']', (size_t)(end - line));
+		if (bracket) label = bracket + 1;
+		sep = memchr(label, ':', (size_t)(end - label));
+		if (!sep) sep = memchr(label, '=', (size_t)(end - label));
+		if (sep)
+		{
+			for (const char *p = label; p < sep && k + 1 < sizeof(key); p++)
+				if (isalnum((unsigned char)*p)) key[k++] = (char)tolower((unsigned char)*p);
+			key[k] = '\0';
+			if (!strcmp(key, wanted))
+			{
+				char *parsed;
+				errno = 0; *value = strtod(sep + 1, &parsed);
+				if (parsed == sep + 1 || parsed > end || errno || !isfinite(*value)) return (-1);
+				while (parsed < end && isspace((unsigned char)*parsed)) parsed++;
+				if (parsed < end && *parsed == '%') parsed++;
+				while (parsed < end && isspace((unsigned char)*parsed)) parsed++;
+				/* Extra annotations may be valid, but are not verified numbers. */
+				return (parsed == end ? 1 : 0);
+			}
+		}
+		line = *end ? end + 1 : NULL;
+	}
+	return (0);
+}
+
+static int ts_any_metric(const char *data, const char *a, const char *b, const char *c, double *number)
+{
+	int found = ts_metric(data, a, number);
+	if (!found && b) found = ts_metric(data, b, number);
+	if (!found && c) found = ts_metric(data, c, number);
+	return (found);
+}
+
+static int ts_has_label(const char *data, const char *label)
+{
+	char *copy = strdup(data);
+	int found;
+	if (!copy) return (0);
+	for (char *p = copy; *p; p++) *p = (char)tolower((unsigned char)*p);
+	found = strstr(copy, label) != NULL;
+	free(copy);
+	return (found);
+}
+
+static int ts_strategy_label(const char *data)
+{
+	char *copy = strdup(data), *line, *save = NULL;
+	int found = 0;
+	if (!copy) return (0);
+	for (char *p = copy; *p; p++) *p = (char)tolower((unsigned char)*p);
+	for (line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+	{
+		if (strstr(line, "strategy") || strstr(line, "estrategia"))
+		{
+			char *value = strchr(line, ':'); if (!value) value = strchr(line, '=');
+			if (value) for (value++; *value; value++) if (isalpha((unsigned char)*value)) found = 1;
+		}
+	}
+	free(copy);
+	return (found);
+}
+
+static int ts_bench_metadata(t_test_case *test, int *values, int size, int operations)
+{
+	static const char *names[] = {"sa", "sb", "ss", "pa", "pb", "ra", "rb", "rr", "rra", "rrb", "rrr"};
+	int counts[11] = {0}, missing = 0;
+	double value = 0, expected = measure_disorder(values, size);
+	int found;
+	char *copy, *line, *save = NULL;
+	if (!test->err_size)
+	{
+		snprintf(test->reason, sizeof(test->reason), "--bench produced no metadata on stderr");
+		return (TEST_KO);
+	}
+	if (memchr(test->err, '\0', test->err_size))
+	{
+		snprintf(test->reason, sizeof(test->reason), "benchmark metadata contains a NUL byte");
+		return (TEST_KO);
+	}
+	found = ts_any_metric(test->err, "disorder", "disorderpercentage", "desorden", &value);
+	if (found < 0 || (found && (expected < 0 || fabs(value - expected) > 0.02)))
+	{
+		snprintf(test->reason, sizeof(test->reason), "disorder mismatch: computed %.4f%% from input, reported %.4f%%", expected, value);
+		return (TEST_KO);
+	}
+	missing += found == 0;
+	found = ts_any_metric(test->err, "totalops", "totaloperations", "total", &value);
+	if (found < 0 || (found && value != operations))
+	{
+		snprintf(test->reason, sizeof(test->reason), "total operation mismatch: stdout has %d, metadata reports %.2f", operations, value);
+		return (TEST_KO);
+	}
+	missing += found == 0;
+	copy = strdup(test->out);
+	if (!copy) { snprintf(test->reason, sizeof(test->reason), "tester allocation failed while reading counters"); return (TEST_KO); }
+	for (line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+		for (int i = 0; i < 11; i++) if (!strcmp(line, names[i])) counts[i]++;
+	free(copy);
+	for (int i = 0; i < 11; i++)
+	{
+		found = ts_metric(test->err, names[i], &value);
+		if (found < 0 || (found && value != counts[i]))
+		{
+			snprintf(test->reason, sizeof(test->reason), "counter %s mismatch: stdout has %d, metadata reports %.2f", names[i], counts[i], value);
+			return (TEST_KO);
+		}
+		missing += found == 0;
+	}
+	if (!ts_strategy_label(test->err)) missing++;
+	if (!(ts_has_label(test->err, "o(") || ts_has_label(test->err, "o ("))) missing++;
+	if (missing)
+	{
+		snprintf(test->reason, sizeof(test->reason), "%d metadata fields not recognized; inspect stderr for absent fields or a different text format. No automatic pass is claimed", missing);
+		return (TEST_SKIP);
+	}
+	snprintf(test->reason, sizeof(test->reason), "disorder %.2f%%, total %d and all 11 counters agree with the captured operations; strategy and complexity labels present", expected, operations);
+	return (TEST_OK);
+}
+
+static void ts_bench_tests(t_test_suite *suite)
+{
+	int data[3][5] = {{-6, 0, 5, 11, 27}, {27, 11, 5, 0, -6}, {-6, 5, 0, 11, 27}};
+	const char *labels[] = {"sorted", "reverse", "partially shuffled"};
+	char name[120], *storage, **args;
+	t_test_case test;
+	int count, state;
+	ts_section(suite, "Benchmark metadata and independently computed disorder");
+	for (int i = 0; i < 3 && !g_stop_signal; i++)
+	{
+		snprintf(name, sizeof(name), "--bench --simple, %s input", labels[i]);
+		if (!ts_begin(suite, &test, name, "valid stdout operations; stderr disorder, strategy, complexity, total and per-operation counters")) break ;
+		storage = NULL; args = ts_arguments(suite->program, ALG_SIMPLE, 1, data[i], 5, &storage);
+		count = -1; state = TEST_KO;
+		if (args && ts_capture(suite, &test, args, "", suite->project, suite->config->timeout_seconds))
+			count = ts_sort_output(&test, data[i], 5, -1, 1);
+		if (count >= 0) state = ts_bench_metadata(&test, data[i], 5, count);
+		if (!args) { suite->infrastructure_error = 1; snprintf(test.reason, sizeof(test.reason), "tester allocation failed"); }
+		ts_finish(suite, &test, state, "%s", test.reason);
+		free(args); free(storage);
+	}
+	ts_section_end(suite);
+}
+
+static int ts_copy_file(const char *source, const char *dest, mode_t mode)
+{
+	int in_fd = open(source, O_RDONLY), out_fd;
+	char buffer[16384]; ssize_t count;
+	if (in_fd < 0) return (0);
+	out_fd = open(dest, O_WRONLY | O_CREAT | O_EXCL, mode & 0777);
+	if (out_fd < 0) return (close(in_fd), 0);
+	while ((count = read(in_fd, buffer, sizeof(buffer))) != 0)
+	{
+		if (count < 0) { if (errno == EINTR) continue ; close(in_fd); close(out_fd); return (0); }
+		for (ssize_t offset = 0; offset < count; )
+		{
+			ssize_t written = write(out_fd, buffer + offset, (size_t)(count - offset));
+			if (written < 0 && errno == EINTR) continue ;
+			if (written <= 0) return (close(in_fd), close(out_fd), 0);
+			offset += written;
+		}
+	}
+	close(in_fd);
+	return (close(out_fd) == 0);
+}
+
+static int ts_copy_tree(t_test_suite *suite, const char *source, const char *dest,
+		int depth, int *files, unsigned long long *bytes, char *reason, size_t reason_size)
+{
+	DIR *dir;
+	struct dirent *entry;
+	struct stat st;
+	char from[PATH_MAX], to[PATH_MAX];
+	int ok = 1;
+	if (depth > 40) { snprintf(reason, reason_size, "source nesting exceeds 40 levels: %s", source); return (0); }
+	dir = opendir(source);
+	if (!dir) { snprintf(reason, reason_size, "cannot open source directory: %s", source); return (0); }
+	while ((entry = readdir(dir)) && ok)
+	{
+		const char *name = entry->d_name;
+		size_t length = strlen(name);
+		if (!strcmp(name, ".") || !strcmp(name, "..") || !strcmp(name, ".git")
+			|| !strcmp(name, "__pycache__") || !strcmp(name, ".venv") || !strcmp(name, "venv")
+			|| !strcmp(name, "push_swap_benchmark.c") || !strcmp(name, "ps_benchmark")
+			|| !strcmp(name, "ps-benchmark") || !strcmp(name, "install.sh")
+			|| !strcmp(name, "benchmark-preview.png") || !strncmp(name, "ps-benchmark-tests-", 19)
+			|| (length > 2 && (!strcmp(name + length - 2, ".o") || !strcmp(name + length - 2, ".a")))) continue ;
+		if (!ts_join(from, sizeof(from), source, name) || !ts_join(to, sizeof(to), dest, name))
+			{ snprintf(reason, reason_size, "source path is too long"); ok = 0; break ; }
+		if (!strcmp(from, suite->root)) continue ;
+		if (lstat(from, &st)) { snprintf(reason, reason_size, "cannot inspect %.3000s", from); ok = 0; break ; }
+		if (S_ISLNK(st.st_mode)) { snprintf(reason, reason_size, "source copy does not follow symlinks: %.3000s", from); ok = 0; break ; }
+		if (S_ISDIR(st.st_mode))
+		{
+			if (mkdir(to, 0700) < 0 || !ts_copy_tree(suite, from, to, depth + 1, files, bytes, reason, reason_size)) ok = 0;
+		}
+		else if (S_ISREG(st.st_mode))
+		{
+			if (!strcmp(name, "push_swap") || !strcmp(name, "checker")) continue ;
+			*bytes += (unsigned long long)st.st_size;
+			if (++(*files) > 4096 || *bytes > 64ULL * 1024 * 1024)
+				{ snprintf(reason, reason_size, "source copy exceeds 4096 files or 64 MiB"); ok = 0; break ; }
+			if (!ts_copy_file(from, to, st.st_mode)) { snprintf(reason, reason_size, "cannot copy %.3000s: %.500s", from, strerror(errno)); ok = 0; }
+		}
+	}
+	closedir(dir);
+	return (ok);
+}
+
+static int ts_count_objects(const char *root)
+{
+	DIR *dir = opendir(root);
+	struct dirent *entry;
+	struct stat st;
+	char path[PATH_MAX];
+	int count = 0, sub;
+	if (!dir) return (-1);
+	while ((entry = readdir(dir)))
+	{
+		size_t n = strlen(entry->d_name);
+		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue ;
+		if (!ts_join(path, sizeof(path), root, entry->d_name) || lstat(path, &st)) { count = -1; break ; }
+		if (S_ISDIR(st.st_mode))
+		{
+			sub = ts_count_objects(path);
+			if (sub < 0) { count = -1; break ; }
+			count += sub;
+		}
+		else if (S_ISREG(st.st_mode) && n > 2 && !strcmp(entry->d_name + n - 2, ".o")) count++;
+	}
+	closedir(dir);
+	return (count);
+}
+
+static int ts_definition(const char *text, const char *pattern)
+{
+	regex_t regex;
+	int matched;
+	if (regcomp(&regex, pattern, REG_EXTENDED | REG_NEWLINE)) return (0);
+	matched = regexec(&regex, text, 0, NULL, 0) == 0;
+	regfree(&regex);
+	return (matched);
+}
+
+static int ts_build_command(t_test_suite *suite, const char *name, char *const args[],
+		const char *binary, int expectation)
+{
+	t_test_case test;
+	struct stat before = {0}, after = {0};
+	int ok, objects;
+	stat(binary, &before);
+	if (!ts_begin(suite, &test, name, "successful command in isolated source copy; original project is unchanged")) return (0);
+	ok = ts_capture(suite, &test, args, "", suite->sandbox,
+		suite->config->timeout_seconds < 30 ? 30 : suite->config->timeout_seconds);
+	if (ok) ok = ts_success(&test);
+	if (ok && (expectation == 1 || expectation == 2))
+	{
+		if (stat(binary, &after) || !S_ISREG(after.st_mode) || access(binary, X_OK))
+		{
+			snprintf(test.reason, sizeof(test.reason), "command completed but expected executable was not created: %s", binary); ok = 0;
+		}
+	}
+	if (ok && expectation == 2)
+	{
+#ifdef __APPLE__
+		int changed = before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec || before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec;
+#else
+		int changed = before.st_mtim.tv_sec != after.st_mtim.tv_sec || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec;
+#endif
+		if (changed || before.st_ino != after.st_ino || before.st_size != after.st_size)
+		{
+			snprintf(test.reason, sizeof(test.reason), "second make changed the executable (timestamp, inode or size): unnecessary relink"); ok = 0;
+		}
+	}
+	if (ok && (expectation == 3 || expectation == 4))
+	{
+		objects = ts_count_objects(suite->sandbox);
+		if (objects != 0 || (expectation == 4 && access(binary, F_OK) == 0))
+		{
+			snprintf(test.reason, sizeof(test.reason), "cleanup left %d object files%s", objects, expectation == 4 ? " or retained the executable" : ""); ok = 0;
+		}
+	}
+	ts_finish(suite, &test, ok ? TEST_OK : TEST_KO, "%s", ok ? "command and resulting build state match" : test.reason);
+	return (ok);
+}
+
+static void ts_source_tests(t_test_suite *suite)
+{
+	char makefile[PATH_MAX], tool[PATH_MAX], binary[PATH_MAX], reason[PATH_MAX] = "source copy failed";
+	char *args[5];
+	int files = 0, built = 0;
+	unsigned long long bytes = 0;
+	t_test_case test;
+	if (!ts_join(makefile, sizeof(makefile), suite->project, "Makefile")) { suite->infrastructure_error = 1; return ; }
+	ts_section(suite, "Isolated source, compilation and cleanup");
+	if (!ts_join(makefile, sizeof(makefile), suite->project, "Makefile") || !ts_regular(makefile))
+	{
+		ts_notice(suite, "Makefile availability", suite->config->project_dir ? TEST_KO : TEST_SKIP, "No Makefile at the source root; executable tests can continue. Use --project DIR for source checks.");
+		ts_notice(suite, "Norminette", TEST_SKIP, "Source build copy was not prepared because no Makefile was found.");
+		ts_section_end(suite); return ;
+	}
+	size_t make_size; char *make_text = ts_read(makefile, &make_size);
+	if (make_text && ts_definition(make_text, "^[[:blank:]]*(export[[:blank:]]+)?NAME[[:blank:]]*[:+?]?="))
+		ts_notice(suite, "Makefile executable-name variable", TEST_OK, "a NAME assignment is present in the root Makefile");
+	else ts_notice(suite, "Makefile executable-name variable", TEST_SKIP, "no direct NAME assignment recognized; check included makefiles or generated definitions");
+	free(make_text);
+	if (!ts_begin(suite, &test, "source sandbox", "copy regular project files; exclude VCS, build outputs, this tester and generated reports")) return ;
+	if (!ts_join(suite->sandbox, sizeof(suite->sandbox), suite->root, "source-copy")
+		|| mkdir(suite->sandbox, 0700) || !ts_copy_tree(suite, suite->project, suite->sandbox, 0, &files, &bytes, reason, sizeof(reason)))
+	{
+		ts_finish(suite, &test, TEST_SKIP, "%s; build and Norm checks were not run", reason);
+		suite->sandbox[0] = '\0'; ts_section_end(suite); return ;
+	}
+	ts_finish(suite, &test, TEST_OK, "%d files copied (%llu bytes); original source is unchanged", files, bytes);
+	const char *base = strrchr(suite->program, '/'); base = base ? base + 1 : suite->program;
+	if (!ts_join(binary, sizeof(binary), suite->sandbox, "push_swap")) { suite->infrastructure_error = 1; return ; }
+	if (!ts_find_tool("make", tool, sizeof(tool)))
+		ts_notice(suite, "Makefile tests", TEST_SKIP, "make is not available in PATH");
+	else
+	{
+		args[0] = tool; args[1] = NULL;
+		built = ts_build_command(suite, "make creates the executable", args, binary, 1);
+		if (!g_stop_signal && built) ts_build_command(suite, "make does not relink", args, binary, 2);
+		if (!g_stop_signal) { args[1] = "all"; args[2] = NULL; ts_build_command(suite, "make all", args, binary, 1); }
+		if (!g_stop_signal) { args[1] = "clean"; ts_build_command(suite, "make clean removes objects", args, binary, 3); }
+		if (!g_stop_signal) { args[1] = "fclean"; ts_build_command(suite, "make fclean removes executable and objects", args, binary, 4); }
+		if (!g_stop_signal) { args[1] = "re"; built = ts_build_command(suite, "make re rebuilds the executable", args, binary, 1); }
+		if (!g_stop_signal && ts_begin(suite, &test, "observed compiler warning flags", "every observable C compilation command includes -Wall -Wextra -Werror"))
+		{
+			args[1] = "-n"; args[2] = "-B"; args[3] = "all"; args[4] = NULL;
+			int ok = ts_capture(suite, &test, args, "", suite->sandbox, 30);
+			int observed = 0, bad = 0;
+			if (ok) ok = ts_success(&test);
+			if (ok)
+			{
+				char *copy = strdup(test.out), *line, *save = NULL;
+				if (!copy) { suite->infrastructure_error = 1; ok = 0; }
+				for (line = copy ? strtok_r(copy, "\n", &save) : NULL; line; line = strtok_r(NULL, "\n", &save))
+					if (strstr(line, ".c") && (strstr(line, " -c ") || strstr(line, " -o ")))
+					{
+						observed++;
+						if (!strstr(line, "-Wall") || !strstr(line, "-Wextra") || !strstr(line, "-Werror")) { bad++; fprintf(test.trace, "Missing flags in: %s\n", line); }
+					}
+				free(copy);
+			}
+			if (!ok) ts_finish(suite, &test, TEST_KO, "%s", test.reason[0] ? test.reason : "could not inspect compiler commands");
+			else if (!observed) ts_finish(suite, &test, TEST_SKIP, "no recognizable C compile commands in make -n -B all; inspect Makefile or its build wrappers");
+			else ts_finish(suite, &test, bad ? TEST_KO : TEST_OK, "%d compilation commands inspected; %d missing required flags", observed, bad);
+		}
+		if (built && !strcmp(base, "push_swap") && access(suite->program, X_OK) != 0) snprintf(suite->program, sizeof(suite->program), "%s", binary);
+		/* Building optional bonus targets is attempted only when declared. */
+		if (!g_stop_signal && !suite->config->checker_path)
+		{
+			size_t length; char *text = ts_read(makefile, &length);
+			if (text && ts_definition(text, "^[[:blank:]]*bonus[[:blank:]]*:"))
+			{
+				args[1] = "bonus"; args[2] = NULL;
+				ts_build_command(suite, "make bonus (declared optional target)", args, binary, 0);
+			}
+			free(text);
+		}
+	}
+	if (!g_stop_signal && ts_find_tool("norminette", tool, sizeof(tool)))
+	{
+		args[0] = tool; args[1] = "."; args[2] = NULL;
+		if (ts_begin(suite, &test, "Norminette on isolated source", "Norminette exits 0 on the copied source"))
+		{
+			int ok = ts_capture(suite, &test, args, "", suite->sandbox, 60);
+			if (ok) ok = ts_success(&test);
+			ts_finish(suite, &test, ok ? TEST_OK : TEST_KO, "%s", ok ? "Norminette succeeded on the tested source copy" : test.reason);
+		}
+	}
+	else if (!g_stop_signal) ts_notice(suite, "Norminette", TEST_SKIP, "norminette is not available in PATH; no Norm compliance is claimed");
+	ts_section_end(suite);
+}
+
+static void ts_memory_tests(t_test_suite *suite)
+{
+	char tool[PATH_MAX], log_path[PATH_MAX + 32], log_option[PATH_MAX + 64];
+	t_test_case test;
+	char *args[16];
+	const char *vectors[][6] = {{"9", "-1", "4", "0", "2", NULL}, {"0", "1", "2", NULL}, {NULL}, {"bad", NULL}, {"3", "3", NULL}, {"2147483648", NULL}};
+	const char *names[] = {"valid unsorted input", "sorted input", "no arguments", "invalid token", "duplicate", "overflow", "checker valid sequence", "checker invalid instruction"};
+	const char *checker_vector[] = {"0", "1", "2", NULL};
+	ts_section(suite, "Memory diagnostics (Valgrind)");
+	if (!ts_find_tool("valgrind", tool, sizeof(tool)))
+	{
+		ts_notice(suite, "memory tools", TEST_SKIP, "Valgrind is not available. Memory correctness is unverified; run an appropriate platform memory tool separately.");
+		ts_section_end(suite); return ;
+	}
+	for (int i = 0; i < (suite->checker[0] ? 8 : 6) && !g_stop_signal; i++)
+	{
+		char name[100]; snprintf(name, sizeof(name), "Valgrind: %s", names[i]);
+		if (!ts_begin(suite, &test, name, "no memory errors or remaining allocations on this input; complete Valgrind summary")) break ;
+		snprintf(log_path, sizeof(log_path), "%s.valgrind.txt", test.stem);
+		snprintf(log_option, sizeof(log_option), "--log-file=%s", log_path);
+		args[0] = tool; args[1] = "--leak-check=full"; args[2] = "--show-leak-kinds=all";
+		args[3] = "--errors-for-leak-kinds=all"; args[4] = "--error-exitcode=99"; args[5] = log_option; args[6] = i < 6 ? suite->program : suite->checker;
+		const char *const *vector = i < 6 ? vectors[i] : checker_vector;
+		const char *input = i == 6 ? "pb\npa\n" : (i == 7 ? "invalid\n" : "");
+		int j = 0; while (vector[j]) { args[j + 7] = (char *)vector[j]; j++; } args[j + 7] = NULL;
+		int ok = ts_capture(suite, &test, args, input, suite->project,
+			suite->config->timeout_seconds < 20 ? 20 : suite->config->timeout_seconds);
+		size_t size; char *log = ts_read(log_path, &size);
+		fprintf(test.trace, "Full memory trace: %s\n", log_path);
+		if (!ok) ts_finish(suite, &test, TEST_KO, "%s", test.reason);
+		else if (WEXITSTATUS(test.status) == 99) ts_finish(suite, &test, TEST_KO, "Valgrind found memory errors or leaks; inspect %s for stack traces and allocation sites", log_path);
+		else if (!log || !strstr(log, "ERROR SUMMARY:")) ts_finish(suite, &test, TEST_SKIP, "Valgrind did not produce a recognizable completion summary; inspect stderr and %s", log_path);
+		else if ((i < 3 || i == 6) && WEXITSTATUS(test.status) != 0) ts_finish(suite, &test, TEST_KO, "valid memory-test input exited with status %d; inspect stderr and %s", WEXITSTATUS(test.status), log_path);
+		else if (!strstr(log, "ERROR SUMMARY: 0 errors")
+			|| !(strstr(log, "All heap blocks were freed") || strstr(log, "in use at exit: 0 bytes")))
+			ts_finish(suite, &test, TEST_KO, "nonzero or incomplete memory-clean summary; inspect %s", log_path);
+		else ts_finish(suite, &test, TEST_OK, "Valgrind reported zero errors and no remaining allocations for this case");
+		free(log);
+	}
+	ts_section_end(suite);
+}
+
+static void ts_checker_tests(t_test_suite *suite)
+{
+	char *args[16];
+	char path[PATH_MAX];
+	ts_section(suite, "Optional checker diagnostics");
+	if (suite->config->checker_path)
+		ts_absolute(suite->config->checker_path, suite->checker, sizeof(suite->checker));
+	else
+	{
+		if (ts_join(path, sizeof(path), suite->project, "checker") && ts_regular(path) && access(path, X_OK) == 0)
+			snprintf(suite->checker, sizeof(suite->checker), "%s", path);
+		else if (suite->sandbox[0] && ts_join(path, sizeof(path), suite->sandbox, "checker") && ts_regular(path) && access(path, X_OK) == 0)
+			snprintf(suite->checker, sizeof(suite->checker), "%s", path);
+	}
+	if (!suite->checker[0] || !ts_regular(suite->checker) || access(suite->checker, X_OK))
+	{
+		ts_notice(suite, "checker availability", suite->config->checker_path ? TEST_KO : TEST_SKIP,
+			"checker executable is unavailable; pass --checker PATH to test it. An optional checker is not downloaded or substituted.");
+		suite->checker[0] = '\0'; ts_section_end(suite); return ;
+	}
+	args[0] = suite->checker; args[1] = "invalid"; args[2] = NULL;
+	ts_exact_case(suite, "checker rejects non-numeric input", args, "", "", "Error\n", 0);
+	args[1] = "5"; args[2] = "5"; args[3] = NULL;
+	if (!g_stop_signal) ts_exact_case(suite, "checker rejects duplicate integers", args, "", "", "Error\n", 0);
+	args[1] = "2147483648"; args[2] = NULL;
+	if (!g_stop_signal) ts_exact_case(suite, "checker rejects upper overflow", args, "", "", "Error\n", 0);
+	args[1] = "-2147483649";
+	if (!g_stop_signal) ts_exact_case(suite, "checker rejects lower overflow", args, "", "", "Error\n", 0);
+	args[1] = NULL;
+	if (!g_stop_signal) ts_exact_case(suite, "checker with no arguments", args, "", "", "", 1);
+	args[1] = "0"; args[2] = "1"; args[3] = "2"; args[4] = NULL;
+	const char *invalid[] = {"invalid\n", " sa\n", "sa \n", "sa\t\n", "\n"};
+	const char *labels[] = {"unknown instruction", "leading space", "trailing space", "trailing tab", "blank instruction"};
+	for (int i = 0; i < 5 && !g_stop_signal; i++)
+	{
+		char name[100]; snprintf(name, sizeof(name), "checker rejects %s", labels[i]);
+		ts_exact_case(suite, name, args, invalid[i], "", "Error\n", 0);
+	}
+	if (!g_stop_signal) ts_exact_case(suite, "checker accepts already sorted input at EOF", args, "", "OK\n", "", 1);
+	if (!g_stop_signal) ts_exact_case(suite, "checker rejects a nonempty B stack", args, "pb\n", "KO\n", "", 1);
+	if (!g_stop_signal) ts_exact_case(suite, "checker accepts all eleven operations", args,
+		"sa\nsa\nsb\nss\nsa\nrr\nrra\nrrb\nrrr\nra\nrb\npb\npa\n", "OK\n", "", 1);
+	args[1] = "0"; args[2] = "1"; args[3] = "2"; args[4] = "3"; args[5] = "4"; args[6] = "5"; args[7] = NULL;
+	if (!g_stop_signal) ts_exact_case(suite, "checker operations with both stacks occupied", args,
+		"pb\npb\npb\nsa\nsa\nsb\nsb\nss\nss\nra\nrra\nrb\nrrb\nrr\nrrr\npa\npa\npa\n", "OK\n", "", 1);
+	/* Each corrective suffix assumes the named operation actually ran. */
+	const char *occupied_ops[] = {"sa", "sb", "ss", "ra", "rb", "rr", "rra", "rrb", "rrr"};
+	const char *occupied_sequences[] = {
+		"pb\npb\npb\nsa\npa\npa\npa\npb\npb\npb\nra\npb\nra\npb\npb\npa\npa\npa\npa\npa\npa\n",
+		"pb\npb\npb\nsb\npa\npa\npa\npb\nra\npb\nra\nra\nra\npb\npb\npb\npb\npa\npa\npa\npa\npa\npa\n",
+		"pb\npb\npb\nss\npa\npa\npa\npb\nra\npb\nra\nra\nra\npb\nra\npb\nra\npb\npb\npa\npa\npa\npa\npa\npa\n",
+		"pb\npb\npb\nra\npa\npa\npa\npb\npb\npb\nra\nra\npb\npb\npb\npa\npa\npa\npa\npa\npa\n",
+		"pb\npb\npb\nrb\npa\npa\npa\nra\npb\npb\nra\nra\nra\npb\npb\npb\npb\npa\npa\npa\npa\npa\npa\n",
+		"pb\npb\npb\nrr\npa\npa\npa\nra\npb\npb\nra\nra\nra\npb\nra\nra\npb\npb\npb\npa\npa\npa\npa\npa\npa\n",
+		"pb\npb\npb\nrra\npa\npa\npa\npb\npb\npb\nra\npb\npb\npb\npa\npa\npa\npa\npa\npa\n",
+		"pb\npb\npb\nrrb\npa\npa\npa\nra\nra\npb\nra\nra\nra\npb\npb\npb\npb\npb\npa\npa\npa\npa\npa\npa\n",
+		"pb\npb\npb\nrrr\npa\npa\npa\nra\nra\npb\nra\nra\nra\npb\npb\nra\npb\npb\npb\npa\npa\npa\npa\npa\npa\n"
+	};
+	for (int i = 0; i < 9 && !g_stop_signal; i++)
+	{
+		char name[100]; snprintf(name, sizeof(name), "checker verifies %s on occupied stacks", occupied_ops[i]);
+		ts_exact_case(suite, name, args, occupied_sequences[i], "OK\n", "", 1);
+	}
+	args[1] = "4"; args[2] = "-3"; args[3] = NULL;
+	if (!g_stop_signal) ts_exact_case(suite, "checker rejects an unsorted input at EOF", args, "", "KO\n", "", 1);
+	if (!g_stop_signal) ts_exact_case(suite, "checker accepts a corrective swap", args, "sa\n", "OK\n", "", 1);
+	for (int attempt = 0; attempt < 6 && !g_stop_signal; attempt++)
+	{
+		int values[5]; char storage[5][16], instructions[1024], name[100];
+		int remaining = 5, used = 0;
+		if (!ts_random_values(suite, values, 5, 100)) break ;
+		args[0] = suite->checker;
+		for (int i = 0; i < 5; i++) { snprintf(storage[i], sizeof(storage[i]), "%d", values[i]); args[i + 1] = storage[i]; }
+		args[6] = NULL;
+		instructions[0] = '\0';
+		while (remaining)
+		{
+			int minimum = 0;
+			for (int i = 1; i < remaining; i++) if (values[i] < values[minimum]) minimum = i;
+			for (int i = 0; i < minimum; i++)
+			{
+				int first = values[0]; memmove(values, values + 1, (size_t)(remaining - 1) * sizeof(int)); values[remaining - 1] = first;
+				used += snprintf(instructions + used, sizeof(instructions) - (size_t)used, "ra\n");
+			}
+			memmove(values, values + 1, (size_t)(remaining - 1) * sizeof(int)); remaining--;
+			used += snprintf(instructions + used, sizeof(instructions) - (size_t)used, "pb\n");
+		}
+		for (int i = 0; i < 5; i++) used += snprintf(instructions + used, sizeof(instructions) - (size_t)used, "pa\n");
+		snprintf(name, sizeof(name), "checker valid generated sequence %d", attempt + 1);
+		ts_exact_case(suite, name, args, instructions, "OK\n", "", 1);
+		if (!g_stop_signal)
+		{
+			snprintf(name, sizeof(name), "checker incorrect generated sequence %d", attempt + 1);
+			ts_exact_case(suite, name, args, "pb\n", "KO\n", "", 1);
+		}
+	}
+	ts_section_end(suite);
+}
+
+static int ts_init(t_test_suite *suite, t_config *config)
+{
+	char parent[PATH_MAX], raw_project[PATH_MAX], path[PATH_MAX];
+	const char *slash;
+	memset(suite, 0, sizeof(*suite));
+	suite->config = config; suite->random = *config;
+	if (!ts_absolute(config->program, suite->program, sizeof(suite->program))) return (0);
+	if (config->project_dir)
+	{
+		if (!realpath(config->project_dir, suite->project)) return (0);
+	}
+	else
+	{
+		snprintf(raw_project, sizeof(raw_project), "%s", suite->program);
+		slash = strrchr(raw_project, '/');
+		if (!slash) return (0);
+		raw_project[slash - raw_project] = '\0';
+		if (!realpath(raw_project[0] ? raw_project : "/", suite->project)) return (0);
+	}
+	struct stat project_stat;
+	if (stat(suite->project, &project_stat)) return (0);
+	if (!S_ISDIR(project_stat.st_mode)) return (errno = ENOTDIR, 0);
+	if (config->report_dir)
+	{
+		if (!ts_absolute(config->report_dir, parent, sizeof(parent)) || !ts_mkdirs(parent)) return (0);
+	}
+	else
+	{
+		const char *cache = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+		char cache_base[PATH_MAX];
+		if (cache && cache[0] == '/')
+		{
+			if (!ts_join(parent, sizeof(parent), cache, "ps-benchmark") || !ts_mkdirs(parent)) return (0);
+		}
+		else if (home && home[0] == '/')
+		{
+			if (!ts_join(cache_base, sizeof(cache_base), home, ".cache")
+				|| !ts_join(parent, sizeof(parent), cache_base, "ps-benchmark") || !ts_mkdirs(parent)) return (0);
+		}
+		else if (snprintf(parent, sizeof(parent), "/tmp") >= (int)sizeof(parent)) return (0);
+	}
+	if (!ts_join(suite->root, sizeof(suite->root), parent, "ps-benchmark-tests-XXXXXX") || !mkdtemp(suite->root)) return (0);
+	if (!realpath(suite->root, path)) return (0);
+	snprintf(suite->root, sizeof(suite->root), "%s", path);
+	if (!ts_join(path, sizeof(path), suite->root, "report.txt")) return (0);
+	suite->report = ts_open(path, "w");
+	if (!suite->report) return (0);
+	fprintf(suite->report, "Push Swap diagnostic suite\nSeed: %u\nRequested executable: %s\nSource root: %s\nTimeout: %d seconds (build/memory tools have a larger minimum)\n",
+		config->seed, suite->program, suite->project, config->timeout_seconds);
+	return (1);
+}
+
+static int run_test_suite(t_config *config)
+{
+	t_test_suite suite;
+	int result;
+	if (!ts_init(&suite, config))
+		return (fprintf(stderr, "Error: could not initialize diagnostic suite paths or report: %s\n", strerror(errno)), 1);
+	printf("Push Swap diagnostic suite\nSeed: %u\nReport: %s/report.txt\n", config->seed, suite.root);
+	printf("Every case records its command, stdin, stdout, stderr and diagnosis.\n");
+	printf("Source checks use an isolated copy. Required flags are not skipped.\n");
+	ts_source_tests(&suite);
+	if (!g_stop_signal && ts_regular(suite.program) && access(suite.program, X_OK) == 0)
+	{
+		printf("\nExecution target: %s\n", suite.program);
+		fprintf(suite.report, "\nExecution target: %s\n", suite.program);
+		ts_error_tests(&suite);
+		if (!g_stop_signal && !suite.infrastructure_error) ts_identity_tests(&suite);
+		if (!g_stop_signal && !suite.infrastructure_error) ts_small_tests(&suite);
+		if (!g_stop_signal && !suite.infrastructure_error) ts_strategy_tests(&suite);
+		if (!g_stop_signal && !suite.infrastructure_error) ts_bench_tests(&suite);
+		if (!g_stop_signal && !suite.infrastructure_error) ts_large_tests(&suite);
+		if (!g_stop_signal && !suite.infrastructure_error) ts_checker_tests(&suite);
+		if (!g_stop_signal && !suite.infrastructure_error) ts_memory_tests(&suite);
+	}
+	else if (!g_stop_signal)
+	{
+		char reason[PATH_MAX + 100]; snprintf(reason, sizeof(reason), "executable unavailable after source checks: %s; compile it or pass -b PATH", suite.program);
+		ts_notice(&suite, "executable availability", TEST_KO, reason);
+		ts_notice(&suite, "execution-dependent tests", TEST_SKIP, "sorting, error, strategy, benchmark, checker and memory cases were not run because the target is unavailable");
+	}
+	printf("\nSummary: %d OK, %d KO, %d SKIP, %d INFO\n",
+		suite.counts[0], suite.counts[1], suite.counts[2], suite.counts[3]);
+	fprintf(suite.report, "\nSummary: %d OK, %d KO, %d SKIP, %d INFO\n",
+		suite.counts[0], suite.counts[1], suite.counts[2], suite.counts[3]);
+	printf("This is a strict diagnostic report, not an official evaluation grade.\n");
+	printf("Full report and per-case reproductions: %s\n", suite.root);
+	result = suite.counts[TEST_KO] || suite.infrastructure_error ? 1 : (suite.counts[TEST_SKIP] ? 2 : 0);
+	if (suite.infrastructure_error) fprintf(stderr, "Tester infrastructure or report-writing error; results are incomplete.\n");
+	if (g_stop_signal) { fprintf(suite.report, "Interrupted by signal %d; remaining cases were not run.\n", (int)g_stop_signal); result = 128 + g_stop_signal; }
+	int report_error = ferror(suite.report);
+	if (fclose(suite.report)) report_error = 1;
+	if (report_error) result = 1;
+	return (result);
+}
+
+/* ===== Entry point: choose diagnostic tests or graph benchmark ===== */
+
 int	main(int argc, char **argv)
 {
 	t_config	config;
@@ -2074,6 +3532,8 @@ int	main(int argc, char **argv)
 	}
 	if (!install_stop_signal_handlers())
 		return (perror("sigaction"), 1);
+	if (config.test_mode)
+		return (run_test_suite(&config));
 	if (!detect_algorithms(&config) || !validate_workload(&config))
 		return (g_stop_signal != 0 ? 128 + g_stop_signal : 1);
 	count = result_count(&config);

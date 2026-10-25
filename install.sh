@@ -31,10 +31,68 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Uninstallation uses only the installer's known paths and managed markers.
+remove_path_block() {
+    local profile staged
+    profile=$1
+    [[ -f "$profile" ]] || return 0
+    grep -Fq '# >>> ps-benchmark PATH >>>' "$profile" || return 0
+    staged=$(mktemp "$benchmark_home/.ps-benchmark-profile.XXXXXXXX")
+    if ! awk '
+        $0 == "# >>> ps-benchmark PATH >>>" {
+            if (inside) exit 1
+            inside = 1
+            next
+        }
+        $0 == "# <<< ps-benchmark PATH <<<" {
+            if (!inside) exit 1
+            inside = 0
+            next
+        }
+        !inside { print }
+        END { if (inside) exit 1 }
+    ' "$profile" > "$staged"; then
+        rm -f -- "$staged"
+        fail "Incomplete PATH markers in $profile; file was kept unchanged."
+    fi
+    # Preserve the profile's permissions and any existing symlink.
+    if ! cat -- "$staged" > "$profile"; then
+        rm -f -- "$staged"
+        fail "Could not update $profile."
+    fi
+    rm -f -- "$staged"
+    printf 'Removed managed PATH block from %s.\n' "$profile"
+}
+
+uninstall() {
+    local profile cache_parent
+    [[ "$benchmark_home" == /* && "$benchmark_home" != / ]] \
+        || fail 'The installation home must be an absolute non-root directory.'
+    [[ ! -d "$target" ]] || fail "$target is a directory; it was not removed."
+    for profile in .bashrc .bash_profile .bash_login .profile .zshrc; do
+        remove_path_block "$benchmark_home/$profile"
+    done
+    rm -f -- "$target"
+    # Only dedicated cache directories are removed, never their parent.
+    rm -rf -- "$benchmark_home/.cache/ps-benchmark"
+    cache_parent=${XDG_CACHE_HOME:-}
+    if [[ "$cache_parent" == /* ]]; then
+        rm -rf -- "$cache_parent/ps-benchmark"
+    fi
+    printf 'ps-benchmark uninstalled; default diagnostic reports removed.\n'
+    printf 'Open a new terminal to refresh the shell command cache.\n'
+    printf 'Downloaded source files and reports saved to custom paths are user files; remove those separately.\n'
+}
+
 case "${1:-}" in
     -h|--help)
-        printf 'Usage: bash install.sh [--no-run | --run [benchmark options]]\n'
+        printf 'Usage: bash install.sh [--no-run | --run [benchmark options] | --uninstall]\n'
         printf 'By default, installs and runs if ./push_swap is executable.\n'
+        exit 0
+        ;;
+    --uninstall)
+        [[ $# -eq 1 ]] || fail '--uninstall does not accept benchmark options.'
+        uninstall
         exit 0
         ;;
     --no-run)

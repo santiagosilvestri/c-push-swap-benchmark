@@ -2,7 +2,7 @@
 
 *Created by **Santiago Silvestri** as a portable benchmarking tool for multi-strategy `push_swap` implementations.*
 
-A single-file C benchmark that compares the available `--simple`, `--medium`, `--complex`, and `--adaptive` modes, validates their output, and displays the results as a terminal graph. It also works with standard `push_swap` programs that accept no strategy flags.
+A single-file C benchmark that compares the available `--simple`, `--medium`, `--complex`, and `--adaptive` modes, validates their output, and displays the results as a terminal graph. It also works with standard `push_swap` programs that accept no strategy flags. An optional `--test` mode runs a diagnostic suite with a report and a reproducible command for every executed case.
 
 ## One-command installation
 
@@ -34,6 +34,24 @@ bash install.sh
 Use `bash install.sh --no-run` to install without starting a benchmark, or `bash install.sh --run -m 100 -r 3` to install and run with custom benchmark options. Rerunning the installer updates the executable and keeps a single managed PATH block in each startup file. Downloads and compilation are staged before replacing an existing executable.
 
 The URL above becomes usable after these files are uploaded to GitHub. If the repository owner, name, or branch changes, update both the installation command and the source URL at the top of `install.sh`.
+
+## Uninstall
+
+Remove the installed command, its managed Bash/Zsh PATH blocks and the default diagnostic report caches:
+
+```bash
+bash -c 'ps_benchmark_installer=$(curl -fsSL https://raw.githubusercontent.com/santiagosilvestri/c-push-swap-benchmark/main/install.sh) && bash -c "$ps_benchmark_installer" -- --uninstall'
+```
+
+With the repository already downloaded, the same operation works offline:
+
+```bash
+bash install.sh --uninstall
+```
+
+No compiler or administrator privileges are needed. Other shell settings and files in `~/.local/bin` are preserved. The uninstaller removes `~/.cache/ps-benchmark` and `$XDG_CACHE_HOME/ps-benchmark` when configured. Open a new terminal afterwards to refresh its command cache. Running the command again is safe.
+
+The remote command becomes available after the updated `install.sh` is published. Source files you downloaded or compiled yourself, reports saved with `--report-dir`, benchmark logs, fallback reports in `/tmp` and caches under a previous custom `XDG_CACHE_HOME` cannot be located reliably; delete those at their chosen locations if you want to remove every local copy. The uninstaller does not delete the project you are testing.
 
 ## Use only the C file
 
@@ -99,7 +117,7 @@ Example:
 ./push_swap --medium 4 1 3 0 2
 ```
 
-The benchmark is intended for Linux, macOS, WSL, and other POSIX-compatible systems.
+The benchmark requires a POSIX environment and a C11 compiler. Linux and WSL are the primary targets; macOS compatibility is intended but has not been validated in this review. Native Windows terminals require WSL or another suitable POSIX environment.
 
 ## Optional strategy flags
 
@@ -164,6 +182,8 @@ Display all available options:
 | `-s` | `--seed` | current time | Seed used to reproduce generated inputs. |
 | `-h` | `--help` | — | Display the help message. |
 
+`--test` (also accepted as `-test`) runs the diagnostic suite described below. Its additional options appear in `--help`; invalid commands keep the short beginner usage message.
+
 Algorithm names can be provided in any order, separated by commas, spaces, or both. These examples select the same modes:
 
 ```bash
@@ -199,6 +219,88 @@ For every input size and run, the benchmark:
 Using the same input for every algorithm is essential. It prevents one strategy from receiving an easier permutation than another during the same run.
 
 The benchmark measures the **number of operations**, not execution time.
+
+## Diagnostic test mode
+
+Run from a project folder, using either the installed command or the manually compiled binary:
+
+```bash
+ps-benchmark --test
+./ps_benchmark --test
+```
+
+Specify another executable or a source directory when needed:
+
+```bash
+ps-benchmark --test -b ../another-project/push_swap
+ps-benchmark --test --project ../another-project -b ../another-project/push_swap
+```
+
+The suite checks all four required strategy flags, independently of which modes are available in graph mode. A rejected required flag is a `KO`. The suite's sizes are fixed; graph-only options such as `-a`, `-m`, `-p`, `-d`, `-H`, and `--log` are rejected with `--test`.
+
+Useful test options:
+
+| Option | Purpose |
+|---|---|
+| `-b PATH`, `--program PATH` | Executable used for behavioral checks. |
+| `--project DIR` | Source root for Makefile and Norminette checks; otherwise inferred from the executable directory. |
+| `--checker PATH` | Checker to test; otherwise searches for the project's `checker`, including one built by its declared `bonus` target. |
+| `--report-dir DIR` | Parent directory for a new, uniquely named report folder. |
+| `-s N`, `--seed N` | Reproduce the generated input sequence. |
+| `-r N`, `--runs N` | Random repetitions, with at least three 100-element cases and two 500-element cases. |
+| `-t N`, `--timeout N` | Seconds per behavioral execution; default 5 in test mode. Build and memory commands have larger minimum time allowances. |
+
+For example:
+
+```bash
+ps-benchmark --test --project ../another-project \
+    -b ../another-project/push_swap \
+    --checker ../another-project/checker \
+    --report-dir ./diagnostics --seed 42 --runs 3 --timeout 5
+```
+
+### What is tested
+
+- Non-numeric tokens, duplicates, integer overflow, malformed tokens and execution without arguments. Error cases require empty stdout and exactly `Error\n` on stderr; they may exit normally with a nonzero status.
+- Sorted inputs and a single value, with zero operations.
+- Every permutation of three and five original test values, with respective operation budgets of 5 and 15, plus mixed signs, integer boundaries and a quoted argument list.
+- Each strategy on reverse input and on the same 50-element random input. Default/adaptive output is compared on that 50-element input; observed equality is not proof of internal routing, and differing valid output is reported as `INFO`.
+- `--bench --simple` on sorted, reverse and partially shuffled inputs. Stdout is simulated; reported disorder, total and all eleven counters are compared with independently computed values. Strategy and complexity labels must be present. Unrecognized text formats receive `SKIP` rather than an automatic pass; recognized incorrect values receive `KO`.
+- Random 100- and 500-element inputs. Each run must sort correctly and use fewer than 2000 or 12000 operations respectively. A low average cannot hide a failing individual run.
+- Makefile build, `all`, repeated `make` without relinking, `clean`, `fclean`, `re`, observed warning flags, and an optional declared `bonus` target. A source copy is used; existing project build artifacts are not removed by the tester. Source build checks expect the assignment's `push_swap` executable. An explicit `-b` may still select a differently named binary for behavioral tests.
+- Norminette when available in `PATH`, on the copied source.
+- Valgrind when available in `PATH`, on valid, sorted, empty and invalid inputs, plus checker instruction cases when a checker is present. Full memory logs are retained. Missing tools or an unrecognized tool completion report receive `SKIP`; successful functional cases alone do not establish memory correctness.
+- Optional checker handling of invalid arguments and instructions, whitespace errors, correct and incorrect final stacks, all eleven operations and generated instruction sequences.
+
+This is a strict development diagnostic, not an official grade calculator: it reports individual failures rather than applying partial-credit tolerances. The suite includes automated checks only; it does not assess authorship, participation, source restrictions, complexity proofs, explanation quality, the oral defense or live coding. No evaluation sheet is bundled or published with the project.
+
+### Follow a failing case
+
+Each case has an ID such as `T0024`, an explicit expected result and a final `OK`, `KO`, `SKIP` or `INFO` status. The terminal prints one result line per completed case, without a separate start message. Every section also prints a summary. In an interactive terminal, `[ OK ]` is green and `[ KO ]` is red. Colors are disabled for redirected output, `TERM=dumb`, or when `NO_COLOR` is set. Saved reports contain plain text.
+
+Reports are kept outside the tested project by default, under `$XDG_CACHE_HOME/ps-benchmark` or `~/.cache/ps-benchmark`. A fresh `ps-benchmark-tests-XXXXXX` folder is created for every run; its absolute path is printed at startup and completion. A private temporary-directory fallback is used when no home/cache location is available. `--report-dir` overrides the parent location.
+
+For each executed case, that folder contains:
+
+- `T0024.details.txt`: expectation, complete argument list, working directory, exit status or signal, duration, captured-output previews and the diagnosis.
+- `T0024.command.sh`: an exact replay command with safely quoted arguments and the saved stdin.
+- `T0024.stdin.txt`: the input supplied to the process.
+- `T0024.stdout` and `T0024.stderr`: original bytes from both streams.
+- `T0024.valgrind.txt`: the memory tool's full trace, for memory cases.
+
+`report.txt` is the overall index. The retained `source-copy` contains the isolated project used for build checks. Unavailable checks have a details file explaining why they were not automatically validated.
+
+On a failure, the terminal prints the details path and a replay command. Use the exact path it prints, for example:
+
+```bash
+sh '/absolute/path/to/ps-benchmark-tests-XXXXXX/T0024.command.sh'
+```
+
+Invalid operations identify the stdout line and byte offset. An incorrect final state records both complete stacks and the first inversion in A. Budget failures report the measured count and limit. Crashes, timeouts and unexpectedly large output have separate diagnoses. Source file/line locations come from tools such as Norminette or Valgrind when available; build the tested executable with debug symbols (`-g`) for useful memory stack traces. A black-box failure alone cannot identify the faulty C source line.
+
+Captured stdout and stderr are limited to 8 MiB per stream; processes exceeding that limit are stopped. After three consecutive timeouts, further subprocess cases are recorded as `SKIP` with their intended replay command, rather than waiting repeatedly on the same hang. Ctrl+C stops the active process group; already completed case reports remain available after an interruption.
+
+Exit status is `0` when automatic checks have no failures or skips, `1` for a failure or tester infrastructure error, `2` for skipped automatic checks without failures, or `128 + signal` after interruption. A missing optional checker also leaves its coverage explicitly skipped.
 
 ## Input generation
 
@@ -358,7 +460,7 @@ The benchmark includes protections against accidental heavy executions:
 - stricter limits for the quadratic `simple` strategy;
 - timeout for each child process;
 - maximum accepted operation count;
-- termination of blocked or excessively long processes;
+- termination of blocked or excessively long processes, plus remaining descendants in the child process group;
 - validation that the selected program exists and is executable.
 
 Large values remain expensive even when permitted. Start with 100 or 500 elements before testing larger inputs.
@@ -378,7 +480,7 @@ Large values remain expensive even when permitted. Start with 100 or 500 element
 The standalone repository only needs:
 
 ```text
-Push-Swap-Graph-Benchmark/
+c-push-swap-benchmark/
 ├── push_swap_benchmark.c
 ├── install.sh
 ├── benchmark-preview.png
